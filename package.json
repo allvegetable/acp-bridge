@@ -1,0 +1,24 @@
+{
+  "name": "acp-bridge",
+  "version": "1.0.0",
+  "description": "ACP bridge daemon and CLI for opencode",
+  "main": "dist/daemon.js",
+  "bin": {
+    "acp-bridge": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "daemon": "node dist/daemon.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.14.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  }
+}
