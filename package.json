@@ -1,19 +1,45 @@
 {
   "name": "acp-bridge",
-  "version": "1.0.0",
-  "description": "ACP bridge daemon and CLI for opencode",
+  "version": "0.3.0",
+  "description": "Daemon + CLI that manages coding agents (OpenCode, Codex, Claude, Gemini) through the Agent Client Protocol (ACP)",
   "main": "dist/daemon.js",
   "bin": {
-    "acp-bridge": "dist/cli.js"
+    "acp-bridge": "dist/cli.js",
+    "acp-bridged": "dist/daemon.js"
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "daemon": "node dist/daemon.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "coding-agent",
+    "opencode",
+    "codex",
+    "claude",
+    "gemini",
+    "multi-agent",
+    "orchestrator",
+    "cli"
+  ],
+  "author": "allvegetable",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allvegetable/acp-bridge.git"
+  },
+  "homepage": "https://github.com/allvegetable/acp-bridge#readme",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.14.1"
   },

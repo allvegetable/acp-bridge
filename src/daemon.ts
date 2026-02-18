@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { execSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
