@@ -1,7 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -18,12 +19,15 @@ type PendingPermission = {
 
 type AgentRecord = {
   name: string;
+  type: string;
   cwd: string;
   child: ChildProcessWithoutNullStreams;
   connection: acp.ClientSideConnection;
   sessionId: string;
   state: AgentState;
   lastError: string | null;
+  stderrBuffer: string[];
+  protocolVersion: string | number | null;
   lastText: string;
   currentText: string;
   stopReason: string | null;
@@ -31,6 +35,13 @@ type AgentRecord = {
   activeTask: { taskId: string; subtaskId: string } | null;
   createdAt: string;
   updatedAt: string;
+};
+
+type EndpointCheckResult = {
+  reachable: boolean;
+  statusCode: number | null;
+  latencyMs: number | null;
+  errorCode: string | null;
 };
 
 type AgentConfig = {
@@ -140,6 +151,8 @@ const chunkSubscribers = new Map<string, Set<(chunk: string) => void>>();
 let nextPermissionRequestId = 1;
 const MAX_COMPLETED_TASKS = parsePositiveIntegerEnv("ACP_BRIDGE_MAX_TASKS", 100);
 const TASK_TTL_MS = parsePositiveIntegerEnv("ACP_BRIDGE_TASK_TTL_MS", 3600000);
+const MAX_STDERR_LINES = 50;
+const ENDPOINT_TIMEOUT_MS = 5000;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -185,6 +198,218 @@ function loadConfig(): BridgeConfig {
   }
 }
 
+function pushStderrLine(buffer: string[], line: string): void {
+  const normalized = line.trim();
+  if (!normalized) {
+    return;
+  }
+  buffer.push(normalized);
+  if (buffer.length > MAX_STDERR_LINES) {
+    buffer.splice(0, buffer.length - MAX_STDERR_LINES);
+  }
+}
+
+function commandExists(command: string, env: Record<string, string | undefined>): boolean {
+  const expanded = expandHomePath(command);
+  if (expanded.includes("/")) {
+    return existsSync(expanded);
+  }
+  try {
+    execSync(`which ${expanded}`, {
+      stdio: "ignore",
+      env: env as NodeJS.ProcessEnv,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getTypeBaseUrl(type: string, env: Record<string, string | undefined>): string | null {
+  if (type === "codex") {
+    return env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+  }
+  if (type === "claude") {
+    return env.ANTHROPIC_BASE_URL || "https://api.anthropic.com";
+  }
+  if (type === "gemini") {
+    return env.GOOGLE_GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+  }
+  return null;
+}
+
+function getApiKeyValue(type: string, env: Record<string, string | undefined>): string | null {
+  if (type === "codex") {
+    return env.OPENAI_API_KEY?.trim() || null;
+  }
+  if (type === "claude") {
+    return env.ANTHROPIC_API_KEY?.trim() || env.ANTHROPIC_AUTH_TOKEN?.trim() || null;
+  }
+  if (type === "gemini") {
+    return env.GEMINI_API_KEY?.trim() || null;
+  }
+  return null;
+}
+
+function getApiKeyRequirement(type: string): { required: boolean; message: string | null } {
+  if (type === "codex") {
+    return {
+      required: true,
+      message: "OPENAI_API_KEY is not set. Set it in environment or config.",
+    };
+  }
+  if (type === "claude") {
+    return {
+      required: true,
+      message: "ANTHROPIC_API_KEY is not set. Set it in environment or config.",
+    };
+  }
+  if (type === "gemini") {
+    return {
+      required: true,
+      message: "GEMINI_API_KEY is not set. Set it in environment or config.",
+    };
+  }
+  return { required: false, message: null };
+}
+
+function apiKeyFormatStatus(type: string, env: Record<string, string | undefined>): string {
+  const value = getApiKeyValue(type, env);
+  if (!value) {
+    const required = getApiKeyRequirement(type).required;
+    return required ? "missing" : "not_required";
+  }
+  if (type === "codex") {
+    return value.startsWith("sk-") ? "valid" : "invalid";
+  }
+  if (type === "claude") {
+    return value.startsWith("cr_") || value.startsWith("sk-ant-") ? "valid" : "invalid";
+  }
+  if (type === "gemini") {
+    return value.startsWith("AIza") ? "valid" : "invalid";
+  }
+  return "unknown";
+}
+
+function classifyAskError(error: unknown): string {
+  const message = error instanceof Error ? error.message : JSON.stringify(error) ?? String(error);
+  const statusMatch = message.match(/\b(401|403|429|503)\b/);
+  if (statusMatch) {
+    const code = Number(statusMatch[1]);
+    if (code === 401 || code === 403) {
+      return "API key invalid or expired. Check your key.";
+    }
+    if (code === 429) {
+      return "Rate limited. Check proxy quota.";
+    }
+    if (code === 503) {
+      return "Service unavailable. Check proxy status.";
+    }
+  }
+  if (message.includes("ECONNREFUSED")) {
+    return "Connection refused. Check base URL.";
+  }
+  if (message.includes("ENOTFOUND")) {
+    return "DNS resolution failed. Check network.";
+  }
+  return message;
+}
+
+function endpointCheck(urlString: string): Promise<EndpointCheckResult> {
+  return new Promise((resolve) => {
+    let url: URL;
+    try {
+      url = new URL(urlString);
+    } catch {
+      resolve({
+        reachable: false,
+        statusCode: null,
+        latencyMs: null,
+        errorCode: "EINVAL",
+      });
+      return;
+    }
+
+    const start = Date.now();
+    const requestImpl = url.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = requestImpl(
+      {
+        method: "HEAD",
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+      },
+      (res) => {
+        res.resume();
+        res.once("end", () => {
+          const latencyMs = Date.now() - start;
+          const statusCode = res.statusCode ?? null;
+          resolve({
+            reachable: statusCode !== null,
+            statusCode,
+            latencyMs,
+            errorCode: null,
+          });
+        });
+      },
+    );
+
+    req.setTimeout(ENDPOINT_TIMEOUT_MS, () => {
+      req.destroy(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }));
+    });
+    req.once("error", (error: NodeJS.ErrnoException) => {
+      resolve({
+        reachable: false,
+        statusCode: null,
+        latencyMs: null,
+        errorCode: error.code || "UNKNOWN",
+      });
+    });
+    req.end();
+  });
+}
+
+async function preflightCheck(type: string, env: Record<string, string | undefined>): Promise<void> {
+  const configuredCommand = env.ACP_BRIDGE_AGENT_COMMAND?.trim();
+  if (configuredCommand) {
+    if (!commandExists(configuredCommand, env)) {
+      throw new HttpError(400, `${configuredCommand} binary not found on PATH.`);
+    }
+  } else if (type === "codex") {
+    if (!commandExists("codex-acp", env) && !commandExists("codex", env)) {
+      throw new HttpError(400, "codex-acp binary not found on PATH. Install with: cargo install codex-acp");
+    }
+  } else if (type === "claude") {
+    if (!commandExists("claude-agent-acp", env)) {
+      throw new HttpError(400, "claude-agent-acp binary not found on PATH. Install it globally first.");
+    }
+  } else if (type === "gemini") {
+    if (!commandExists("gemini", env)) {
+      throw new HttpError(400, "gemini binary not found on PATH. Install @google/gemini-cli.");
+    }
+  } else if (type === "opencode") {
+    if (!commandExists("opencode", env)) {
+      throw new HttpError(400, "opencode binary not found on PATH. Install OpenCode first.");
+    }
+  } else if (!commandExists(type, env)) {
+    throw new HttpError(400, `${type} binary not found on PATH.`);
+  }
+
+  const keyRequirement = getApiKeyRequirement(type);
+  if (keyRequirement.required && !getApiKeyValue(type, env)) {
+    throw new HttpError(400, keyRequirement.message || "required API key is missing");
+  }
+
+  const baseUrl = getTypeBaseUrl(type, env);
+  if (baseUrl) {
+    const endpoint = await endpointCheck(baseUrl);
+    if (!endpoint.reachable) {
+      const code = endpoint.errorCode || "UNKNOWN";
+      throw new HttpError(400, `Proxy ${baseUrl} is unreachable (${code}). Check the URL.`);
+    }
+  }
+}
+
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
   res.setHeader("content-type", "application/json; charset=utf-8");
@@ -219,10 +444,13 @@ async function readJson(req: IncomingMessage): Promise<any> {
 function toStatus(record: AgentRecord) {
   return {
     name: record.name,
+    type: record.type,
     cwd: record.cwd,
     state: record.state,
     sessionId: record.sessionId,
+    protocolVersion: record.protocolVersion,
     lastError: record.lastError,
+    recentStderr: [...record.stderrBuffer],
     lastText: record.lastText,
     stopReason: record.stopReason,
     pendingPermissions: record.pendingPermissions.map((item) => ({
@@ -665,6 +893,7 @@ async function spawnAgentConnection(input: {
   args: string[];
   env: NodeJS.ProcessEnv;
   getClient: () => acp.Client;
+  onStderrLine?: (line: string) => void;
 }): Promise<{
   child: ChildProcessWithoutNullStreams;
   connection: acp.ClientSideConnection;
@@ -690,10 +919,13 @@ async function spawnAgentConnection(input: {
   });
 
   child.stderr.on("data", (data) => {
-    const record = agents.get(input.name);
-    if (record) {
-      record.updatedAt = nowIso();
-      record.lastError = data.toString("utf8").trim();
+    const lines = data
+      .toString("utf8")
+      .split(/\r?\n/g)
+      .map((line: string) => line.trim())
+      .filter((line: string) => line.length > 0);
+    for (const line of lines) {
+      input.onStderrLine?.(line);
     }
   });
 
@@ -786,6 +1018,7 @@ async function startAgent(input: {
   };
 
   let record: AgentRecord | undefined;
+  const stderrBuffer: string[] = [];
   const client = new BridgeClient(() => record);
   const defaultCommand = input.command || configuredAgent?.command || type;
   const defaultArgsList = requestedArgs || configuredArgs || defaultArgs;
@@ -818,6 +1051,11 @@ async function startAgent(input: {
         ? [{ command: "gemini", args: ["--experimental-acp"] as string[] }]
         : [{ command: defaultCommand, args: defaultArgsList }];
 
+  await preflightCheck(type, {
+    ...finalEnv,
+    ACP_BRIDGE_AGENT_COMMAND: input.command || configuredAgent?.command,
+  });
+
   let child: ChildProcessWithoutNullStreams | undefined;
   let connection: acp.ClientSideConnection | undefined;
   let init: unknown;
@@ -833,6 +1071,13 @@ async function startAgent(input: {
         args: candidate.args,
         env: finalEnv,
         getClient: () => client,
+        onStderrLine: (line: string) => {
+          pushStderrLine(stderrBuffer, line);
+          if (record) {
+            record.updatedAt = nowIso();
+            record.lastError = line;
+          }
+        },
       });
       child = result.child;
       connection = result.connection;
@@ -852,12 +1097,18 @@ async function startAgent(input: {
 
   record = {
     name,
+    type,
     cwd,
     child,
     connection,
     sessionId: (session as any).sessionId,
     state: "idle",
     lastError: null,
+    stderrBuffer,
+    protocolVersion:
+      typeof (init as any).protocolVersion === "number" || typeof (init as any).protocolVersion === "string"
+        ? (init as any).protocolVersion
+        : null,
     lastText: "",
     currentText: "",
     stopReason: null,
@@ -916,6 +1167,15 @@ type AskResult = {
   response: string;
 };
 
+type DoctorResult = {
+  type: string;
+  status: "ok" | "warning" | "error";
+  binary: boolean;
+  apiKey: boolean | null;
+  endpoint: boolean | null;
+  message?: string;
+};
+
 async function askAgent(
   name: string,
   prompt: string,
@@ -968,7 +1228,7 @@ async function askAgent(
       throw error;
     }
     record.state = "error";
-    record.lastError = error instanceof Error ? error.message : JSON.stringify(error) ?? String(error);
+    record.lastError = classifyAskError(error);
     record.updatedAt = nowIso();
     throw error;
   } finally {
@@ -987,6 +1247,106 @@ async function askAgent(
       record.activeTask = null;
     }
   }
+}
+
+async function runDoctorForType(type: string, env: Record<string, string | undefined>): Promise<DoctorResult> {
+  let binary = false;
+  let apiKey: boolean | null = null;
+  let endpoint: boolean | null = null;
+  let message: string | undefined;
+
+  const commandHint =
+    type === "codex"
+      ? "codex-acp"
+      : type === "claude"
+        ? "claude-agent-acp"
+        : type === "gemini"
+          ? "gemini"
+          : "opencode";
+  binary = commandExists(commandHint, env);
+  if (!binary) {
+    message = `${commandHint} binary not found on PATH`;
+  }
+
+  const keyRequirement = getApiKeyRequirement(type);
+  if (keyRequirement.required) {
+    apiKey = Boolean(getApiKeyValue(type, env));
+    if (!apiKey && !message) {
+      message = (keyRequirement.message || "required API key is missing").replace(". Set it in environment or config.", "");
+    }
+  }
+
+  if (binary && (apiKey === null || apiKey)) {
+    const baseUrl = getTypeBaseUrl(type, env);
+    if (baseUrl) {
+      const endpointResult = await endpointCheck(baseUrl);
+      if (endpointResult.reachable) {
+        endpoint = endpointResult.statusCode !== null && endpointResult.statusCode < 500;
+        if (!endpoint && !message && endpointResult.statusCode !== null) {
+          message =
+            endpointResult.statusCode === 503
+              ? "Endpoint returned 503 (service unavailable)"
+              : `Endpoint returned ${endpointResult.statusCode}`;
+        }
+      } else {
+        endpoint = false;
+        if (!message) {
+          message = `Proxy ${baseUrl} is unreachable (${endpointResult.errorCode || "UNKNOWN"})`;
+        }
+      }
+    }
+  }
+
+  let status: "ok" | "warning" | "error" = "ok";
+  if (!binary || apiKey === false) {
+    status = "error";
+  } else if (endpoint === false) {
+    status = "warning";
+  }
+
+  const result: DoctorResult = {
+    type,
+    status,
+    binary,
+    apiKey,
+    endpoint,
+  };
+  if (message) {
+    result.message = message;
+  }
+  return result;
+}
+
+async function buildAgentDiagnose(record: AgentRecord): Promise<unknown> {
+  const configured = bridgeConfig.agents?.[record.type];
+  const env = {
+    ...process.env,
+    ...(configured?.env || {}),
+  };
+  const type = record.type;
+  const keyRequirement = getApiKeyRequirement(type);
+  const apiKeySet = keyRequirement.required ? Boolean(getApiKeyValue(type, env)) : true;
+  const apiKeyFormat = apiKeyFormatStatus(type, env);
+  const baseUrl = getTypeBaseUrl(type, env);
+  const endpointResult = baseUrl ? await endpointCheck(baseUrl) : null;
+  const endpointReachable = endpointResult
+    ? endpointResult.reachable && endpointResult.statusCode !== null && endpointResult.statusCode < 500
+    : true;
+
+  return {
+    agent: record.name,
+    processAlive: !record.child.killed && record.child.exitCode === null,
+    state: record.state,
+    recentStderr: [...record.stderrBuffer],
+    lastError: record.lastError,
+    checks: {
+      apiKeySet,
+      apiKeyFormat,
+      endpointReachable,
+      endpointLatencyMs: endpointResult?.latencyMs ?? null,
+      protocolVersion: record.protocolVersion ?? 1,
+    },
+  };
 }
 
 async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1015,6 +1375,13 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
       return;
     }
 
+    if (method === "GET" && parts.length === 1 && parts[0] === "doctor") {
+      const types = ["codex", "claude", "gemini", "opencode"];
+      const results = await Promise.all(types.map((type) => runDoctorForType(type, process.env)));
+      writeJson(res, 200, { results });
+      return;
+    }
+
     if (parts.length === 2 && parts[0] === "agents" && method === "GET") {
       const record = agents.get(parts[1]);
       if (!record) {
@@ -1022,6 +1389,17 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
         return;
       }
       writeJson(res, 200, toStatus(record));
+      return;
+    }
+
+    if (parts.length === 3 && parts[0] === "agents" && method === "GET" && parts[2] === "diagnose") {
+      const record = agents.get(parts[1]);
+      if (!record) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      const diagnose = await buildAgentDiagnose(record);
+      writeJson(res, 200, diagnose);
       return;
     }
 

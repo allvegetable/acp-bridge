@@ -6,7 +6,18 @@ import { join } from "node:path";
 import { URL } from "node:url";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-type Command = "start" | "ask" | "status" | "list" | "stop" | "approve" | "deny" | "cancel" | "daemon" | "task";
+type Command =
+  | "start"
+  | "ask"
+  | "status"
+  | "list"
+  | "stop"
+  | "approve"
+  | "deny"
+  | "cancel"
+  | "daemon"
+  | "task"
+  | "doctor";
 type DaemonAction = "start" | "stop" | "status";
 type AskOptions = { name: string; prompt: string; stream: boolean };
 type PermissionActionOptions = { name: string; optionId?: string };
@@ -59,6 +70,7 @@ function parseArgs(argv: string[]): { baseUrl: string; command: Command; args: s
         "deny <name> [--option <optionId>]",
         "cancel <name>",
         "daemon start|stop|status",
+        "doctor",
         "task create <json>",
         "task status <taskId> [--subtask <subtaskId>]",
         "task list",
@@ -66,7 +78,7 @@ function parseArgs(argv: string[]): { baseUrl: string; command: Command; args: s
       ],
     });
   }
-  if (!["start", "ask", "status", "list", "stop", "approve", "deny", "cancel", "daemon", "task"].includes(command)) {
+  if (!["start", "ask", "status", "list", "stop", "approve", "deny", "cancel", "daemon", "task", "doctor"].includes(command)) {
     printError(`unknown command: ${command}`);
   }
 
@@ -488,6 +500,26 @@ function requestSse(baseUrl: string, path: string, body?: JsonValue): Promise<un
   });
 }
 
+function printDoctor(result: any): void {
+  const items = Array.isArray(result?.results) ? result.results : [];
+  for (const item of items) {
+    const type = typeof item?.type === "string" ? item.type : "unknown";
+    const status = typeof item?.status === "string" ? item.status : "error";
+    const icon = status === "ok" ? "✅" : status === "warning" ? "⚠️ " : "❌";
+    const message =
+      typeof item?.message === "string" && item.message.length > 0
+        ? item.message
+        : [
+            item?.binary === true ? "binary found" : item?.binary === false ? "binary missing" : "",
+            item?.apiKey === true ? "API key set" : item?.apiKey === false ? "API key missing" : "",
+            item?.endpoint === true ? "endpoint reachable" : item?.endpoint === false ? "endpoint unreachable" : "",
+          ]
+            .filter((part) => part.length > 0)
+            .join(", ");
+    process.stdout.write(`${icon} ${type}: ${message}\n`);
+  }
+}
+
 async function main(): Promise<void> {
   const { baseUrl, command, args } = parseArgs(process.argv.slice(2));
   const rest = [...args];
@@ -566,6 +598,10 @@ async function main(): Promise<void> {
       } else {
         result = await requestJson(baseUrl, "DELETE", `/tasks/${encodeURIComponent(taskCommand.taskId)}`);
       }
+    } else if (command === "doctor") {
+      result = await requestJson(baseUrl, "GET", "/doctor");
+      printDoctor(result);
+      return;
     }
 
     printJson(result ?? { ok: true });
