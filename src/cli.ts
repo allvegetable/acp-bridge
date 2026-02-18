@@ -6,10 +6,16 @@ import { join } from "node:path";
 import { URL } from "node:url";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-type Command = "start" | "ask" | "status" | "list" | "stop" | "approve" | "deny" | "cancel" | "daemon";
+type Command = "start" | "ask" | "status" | "list" | "stop" | "approve" | "deny" | "cancel" | "daemon" | "task";
 type DaemonAction = "start" | "stop" | "status";
 type AskOptions = { name: string; prompt: string; stream: boolean };
 type PermissionActionOptions = { name: string; optionId?: string };
+type TaskAction = "create" | "status" | "list" | "cancel";
+type TaskCommand =
+  | { action: "create"; body: JsonValue }
+  | { action: "status"; taskId: string; subtaskId?: string }
+  | { action: "list" }
+  | { action: "cancel"; taskId: string };
 
 const DEFAULT_BASE_URL = "http://localhost:7800";
 const PID_FILE = "/tmp/acp-bridge.pid";
@@ -53,10 +59,14 @@ function parseArgs(argv: string[]): { baseUrl: string; command: Command; args: s
         "deny <name> [--option <optionId>]",
         "cancel <name>",
         "daemon start|stop|status",
+        "task create <json>",
+        "task status <taskId> [--subtask <subtaskId>]",
+        "task list",
+        "task cancel <taskId>",
       ],
     });
   }
-  if (!["start", "ask", "status", "list", "stop", "approve", "deny", "cancel", "daemon"].includes(command)) {
+  if (!["start", "ask", "status", "list", "stop", "approve", "deny", "cancel", "daemon", "task"].includes(command)) {
     printError(`unknown command: ${command}`);
   }
 
@@ -228,6 +238,67 @@ function parsePermissionActionArgs(args: string[], action: "approve" | "deny"): 
     printError(`unknown ${action} option: ${token}`);
   }
   return { name, optionId };
+}
+
+function parseTaskAction(args: string[]): TaskCommand {
+  const action = args.shift();
+  if (!action) {
+    printError("task requires create|status|list|cancel");
+  }
+  if (!["create", "status", "list", "cancel"].includes(action)) {
+    printError(`unknown task action: ${action}`);
+  }
+  const taskAction = action as TaskAction;
+
+  if (taskAction === "list") {
+    return { action: "list" };
+  }
+
+  if (taskAction === "create") {
+    const payload = args.join(" ").trim();
+    if (!payload) {
+      printError("task create requires a JSON payload");
+    }
+    try {
+      return { action: "create", body: JSON.parse(payload) as JsonValue };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      printError(`invalid task JSON: ${message}`);
+    }
+  }
+
+  if (taskAction === "status") {
+    const taskId = args.shift();
+    if (!taskId) {
+      printError("task status requires <taskId>");
+    }
+    let subtaskId: string | undefined;
+    while (args.length > 0) {
+      const token = args.shift();
+      if (!token) {
+        continue;
+      }
+      if (token === "--subtask") {
+        const value = args.shift();
+        if (!value) {
+          printError("missing value for --subtask");
+        }
+        subtaskId = value;
+        continue;
+      }
+      printError(`unknown task status option: ${token}`);
+    }
+    return { action: "status", taskId, subtaskId };
+  }
+
+  const taskId = args.shift();
+  if (!taskId) {
+    printError("task cancel requires <taskId>");
+  }
+  if (args.length > 0) {
+    printError(`unknown task cancel option: ${args[0]}`);
+  }
+  return { action: "cancel", taskId };
 }
 
 function requestJson(
@@ -476,6 +547,25 @@ async function main(): Promise<void> {
         printError("cancel requires <name>");
       }
       result = await requestJson(baseUrl, "POST", `/agents/${encodeURIComponent(name)}/cancel`);
+    } else if (command === "task") {
+      const taskCommand = parseTaskAction(rest);
+      if (taskCommand.action === "create") {
+        result = await requestJson(baseUrl, "POST", "/tasks", taskCommand.body);
+      } else if (taskCommand.action === "status") {
+        if (taskCommand.subtaskId) {
+          result = await requestJson(
+            baseUrl,
+            "GET",
+            `/tasks/${encodeURIComponent(taskCommand.taskId)}/subtasks/${encodeURIComponent(taskCommand.subtaskId)}`,
+          );
+        } else {
+          result = await requestJson(baseUrl, "GET", `/tasks/${encodeURIComponent(taskCommand.taskId)}`);
+        }
+      } else if (taskCommand.action === "list") {
+        result = await requestJson(baseUrl, "GET", "/tasks");
+      } else {
+        result = await requestJson(baseUrl, "DELETE", `/tasks/${encodeURIComponent(taskCommand.taskId)}`);
+      }
     }
 
     printJson(result ?? { ok: true });

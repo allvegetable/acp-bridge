@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
@@ -41,6 +42,33 @@ type BridgeConfig = {
   port?: number;
   host?: string;
   agents?: Record<string, AgentConfig>;
+};
+
+type SubtaskState = "pending" | "running" | "done" | "error" | "cancelled";
+type TaskState = "running" | "done" | "error" | "cancelled";
+
+type TaskSubtaskRecord = {
+  id: string;
+  agent: string;
+  prompt: string;
+  dependsOn: string[];
+  state: SubtaskState;
+  result: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
+type TaskRecord = {
+  id: string;
+  name: string;
+  state: TaskState;
+  subtasks: TaskSubtaskRecord[];
+  createdAt: string;
+  updatedAt: string;
+  cancelRequested: boolean;
 };
 
 class HttpError extends Error {
@@ -102,6 +130,7 @@ class BridgeClient implements acp.Client {
 }
 
 const agents = new Map<string, AgentRecord>();
+const tasks = new Map<string, TaskRecord>();
 const bridgeConfig = loadConfig();
 const chunkSubscribers = new Map<string, Set<(chunk: string) => void>>();
 let nextPermissionRequestId = 1;
@@ -257,6 +286,284 @@ function cancelAllPendingPermissions(record: AgentRecord): number {
     count += 1;
   }
   return count;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isSubtaskTerminal(state: SubtaskState): boolean {
+  return state === "done" || state === "error" || state === "cancelled";
+}
+
+function findTaskSubtask(task: TaskRecord, subtaskId: string): TaskSubtaskRecord | undefined {
+  return task.subtasks.find((item) => item.id === subtaskId);
+}
+
+function toTaskStatus(task: TaskRecord) {
+  return {
+    id: task.id,
+    name: task.name,
+    state: task.state,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    subtasks: task.subtasks.map((subtask) => ({
+      id: subtask.id,
+      agent: subtask.agent,
+      prompt: subtask.prompt,
+      dependsOn: subtask.dependsOn,
+      state: subtask.state,
+      result: subtask.result,
+      error: subtask.error,
+      createdAt: subtask.createdAt,
+      updatedAt: subtask.updatedAt,
+      startedAt: subtask.startedAt,
+      completedAt: subtask.completedAt,
+    })),
+  };
+}
+
+function refreshTaskState(task: TaskRecord): void {
+  if (task.state === "cancelled") {
+    task.updatedAt = nowIso();
+    return;
+  }
+  if (task.subtasks.some((item) => item.state === "error")) {
+    task.state = "error";
+    task.updatedAt = nowIso();
+    return;
+  }
+  if (task.subtasks.length > 0 && task.subtasks.every((item) => item.state === "done")) {
+    task.state = "done";
+    task.updatedAt = nowIso();
+    return;
+  }
+  task.state = "running";
+  task.updatedAt = nowIso();
+}
+
+function renderSubtaskPrompt(task: TaskRecord, subtask: TaskSubtaskRecord): string {
+  return subtask.prompt.replace(/\{\{\s*([A-Za-z0-9_-]+)\.result\s*\}\}/g, (_, dependencyId: string) => {
+    const dependency = findTaskSubtask(task, dependencyId);
+    return dependency?.result ?? "";
+  });
+}
+
+async function runSubtask(task: TaskRecord, subtask: TaskSubtaskRecord): Promise<void> {
+  while (subtask.state === "pending") {
+    if (task.cancelRequested || task.state === "cancelled") {
+      const now = nowIso();
+      subtask.state = "cancelled";
+      subtask.updatedAt = now;
+      subtask.completedAt = now;
+      refreshTaskState(task);
+      return;
+    }
+    const dependencies = subtask.dependsOn.map((depId) => findTaskSubtask(task, depId)).filter(Boolean) as TaskSubtaskRecord[];
+    if (dependencies.every((dep) => isSubtaskTerminal(dep.state))) {
+      break;
+    }
+    await sleep(50);
+  }
+
+  if (subtask.state !== "pending") {
+    return;
+  }
+
+  const prompt = renderSubtaskPrompt(task, subtask);
+  const startTime = nowIso();
+  subtask.state = "running";
+  subtask.startedAt = startTime;
+  subtask.updatedAt = startTime;
+  task.updatedAt = startTime;
+
+  try {
+    const result = await askAgent(subtask.agent, prompt);
+    if (subtask.state !== "running") {
+      return;
+    }
+    const doneAt = nowIso();
+    subtask.state = "done";
+    subtask.result = result.response;
+    subtask.error = null;
+    subtask.updatedAt = doneAt;
+    subtask.completedAt = doneAt;
+    refreshTaskState(task);
+  } catch (error) {
+    if (subtask.state !== "running") {
+      return;
+    }
+    const errorAt = nowIso();
+    subtask.state = "error";
+    subtask.error = error instanceof Error ? error.message : JSON.stringify(error) ?? String(error);
+    subtask.updatedAt = errorAt;
+    subtask.completedAt = errorAt;
+    refreshTaskState(task);
+  }
+}
+
+async function runTask(taskId: string): Promise<void> {
+  const task = tasks.get(taskId);
+  if (!task) {
+    return;
+  }
+  await Promise.allSettled(task.subtasks.map((subtask) => runSubtask(task, subtask)));
+  if (task.state === "cancelled") {
+    task.updatedAt = nowIso();
+    return;
+  }
+  refreshTaskState(task);
+}
+
+function validateSubtaskGraph(subtasks: TaskSubtaskRecord[]): void {
+  const ids = new Set(subtasks.map((subtask) => subtask.id));
+  for (const subtask of subtasks) {
+    for (const depId of subtask.dependsOn) {
+      if (!ids.has(depId)) {
+        throw new HttpError(400, `subtask dependency not found: ${depId}`);
+      }
+      if (depId === subtask.id) {
+        throw new HttpError(400, `subtask cannot depend on itself: ${subtask.id}`);
+      }
+    }
+  }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const byId = new Map(subtasks.map((subtask) => [subtask.id, subtask]));
+
+  const visit = (id: string): void => {
+    if (visited.has(id)) {
+      return;
+    }
+    if (visiting.has(id)) {
+      throw new HttpError(400, "subtask dependency cycle detected");
+    }
+    visiting.add(id);
+    const subtask = byId.get(id);
+    if (subtask) {
+      for (const depId of subtask.dependsOn) {
+        visit(depId);
+      }
+    }
+    visiting.delete(id);
+    visited.add(id);
+  };
+
+  for (const subtask of subtasks) {
+    visit(subtask.id);
+  }
+}
+
+function createTask(body: any): TaskRecord {
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!name) {
+    throw new HttpError(400, "task name is required");
+  }
+  if (!Array.isArray(body?.subtasks) || body.subtasks.length === 0) {
+    throw new HttpError(400, "task subtasks are required");
+  }
+
+  const usedIds = new Set<string>();
+  const createdAt = nowIso();
+  const subtasks: TaskSubtaskRecord[] = body.subtasks.map((raw: any, index: number) => {
+    if (!raw || typeof raw !== "object") {
+      throw new HttpError(400, `invalid subtask at index ${index}`);
+    }
+    const agent = typeof raw.agent === "string" ? raw.agent.trim() : "";
+    const prompt = typeof raw.prompt === "string" ? raw.prompt : "";
+    if (!agent) {
+      throw new HttpError(400, `subtask agent is required at index ${index}`);
+    }
+    if (!prompt) {
+      throw new HttpError(400, `subtask prompt is required at index ${index}`);
+    }
+    const requestedId = typeof raw.id === "string" ? raw.id.trim() : "";
+    const id = requestedId || `subtask-${index + 1}`;
+    if (usedIds.has(id)) {
+      throw new HttpError(400, `duplicate subtask id: ${id}`);
+    }
+    usedIds.add(id);
+
+    const dependsOn = Array.isArray(raw.dependsOn)
+      ? raw.dependsOn
+          .filter((item: unknown): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0)
+      : [];
+
+    return {
+      id,
+      agent,
+      prompt,
+      dependsOn,
+      state: "pending",
+      result: null,
+      error: null,
+      createdAt,
+      updatedAt: createdAt,
+      startedAt: null,
+      completedAt: null,
+    };
+  });
+
+  validateSubtaskGraph(subtasks);
+
+  const task: TaskRecord = {
+    id: randomUUID(),
+    name,
+    state: "running",
+    subtasks,
+    createdAt,
+    updatedAt: createdAt,
+    cancelRequested: false,
+  };
+  tasks.set(task.id, task);
+  void runTask(task.id);
+  return task;
+}
+
+async function cancelTask(task: TaskRecord): Promise<{ cancelledSubtasks: number }> {
+  task.cancelRequested = true;
+  task.state = "cancelled";
+  task.updatedAt = nowIso();
+
+  let cancelledSubtasks = 0;
+  const cancelAgents = new Set<string>();
+  for (const subtask of task.subtasks) {
+    const wasRunning = subtask.state === "running";
+    if (subtask.state === "pending" || wasRunning) {
+      const cancelledAt = nowIso();
+      subtask.state = "cancelled";
+      subtask.updatedAt = cancelledAt;
+      subtask.completedAt = cancelledAt;
+      cancelledSubtasks += 1;
+      if (wasRunning) {
+        cancelAgents.add(subtask.agent);
+      }
+    }
+  }
+
+  for (const agentName of cancelAgents) {
+    const record = agents.get(agentName);
+    if (!record) {
+      continue;
+    }
+    try {
+      await record.connection.cancel({ sessionId: record.sessionId } as any);
+      const cancelledPermissions = cancelAllPendingPermissions(record);
+      if (cancelledPermissions > 0 || record.state === "working") {
+        record.state = "idle";
+        record.updatedAt = nowIso();
+      }
+    } catch {
+      // best effort cancel
+    }
+  }
+
+  return { cancelledSubtasks };
 }
 
 async function spawnAgentConnection(input: {
@@ -708,6 +1015,80 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
         return;
       }
       writeJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (method === "POST" && parts.length === 1 && parts[0] === "tasks") {
+      const body = await readJson(req);
+      const task = createTask(body);
+      writeJson(res, 201, toTaskStatus(task));
+      return;
+    }
+
+    if (method === "GET" && parts.length === 1 && parts[0] === "tasks") {
+      writeJson(
+        res,
+        200,
+        Array.from(tasks.values()).map((task) => toTaskStatus(task)),
+      );
+      return;
+    }
+
+    if (method === "GET" && parts.length === 2 && parts[0] === "tasks") {
+      const task = tasks.get(parts[1]);
+      if (!task) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      writeJson(res, 200, toTaskStatus(task));
+      return;
+    }
+
+    if (method === "GET" && parts.length === 4 && parts[0] === "tasks" && parts[2] === "subtasks") {
+      const task = tasks.get(parts[1]);
+      if (!task) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      const subtask = findTaskSubtask(task, parts[3]);
+      if (!subtask) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      writeJson(res, 200, {
+        taskId: task.id,
+        taskName: task.name,
+        taskState: task.state,
+        subtask: {
+          id: subtask.id,
+          agent: subtask.agent,
+          prompt: subtask.prompt,
+          dependsOn: subtask.dependsOn,
+          state: subtask.state,
+          result: subtask.result,
+          error: subtask.error,
+          createdAt: subtask.createdAt,
+          updatedAt: subtask.updatedAt,
+          startedAt: subtask.startedAt,
+          completedAt: subtask.completedAt,
+        },
+      });
+      return;
+    }
+
+    if (method === "DELETE" && parts.length === 2 && parts[0] === "tasks") {
+      const task = tasks.get(parts[1]);
+      if (!task) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      const cancelled = await cancelTask(task);
+      writeJson(res, 200, {
+        ok: true,
+        id: task.id,
+        state: task.state,
+        cancelledSubtasks: cancelled.cancelledSubtasks,
+      });
       return;
     }
 
