@@ -28,6 +28,7 @@ type AgentRecord = {
   currentText: string;
   stopReason: string | null;
   pendingPermissions: PendingPermission[];
+  activeTask: { taskId: string; subtaskId: string } | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -59,6 +60,8 @@ type TaskSubtaskRecord = {
   updatedAt: string;
   startedAt: string | null;
   completedAt: string | null;
+  terminalPromise: Promise<void>;
+  resolveTerminal: () => void;
 };
 
 type TaskRecord = {
@@ -69,6 +72,7 @@ type TaskRecord = {
   createdAt: string;
   updatedAt: string;
   cancelRequested: boolean;
+  cancelController: AbortController;
 };
 
 class HttpError extends Error {
@@ -134,9 +138,19 @@ const tasks = new Map<string, TaskRecord>();
 const bridgeConfig = loadConfig();
 const chunkSubscribers = new Map<string, Set<(chunk: string) => void>>();
 let nextPermissionRequestId = 1;
+const MAX_COMPLETED_TASKS = parsePositiveIntegerEnv("ACP_BRIDGE_MAX_TASKS", 100);
+const TASK_TTL_MS = parsePositiveIntegerEnv("ACP_BRIDGE_TASK_TTL_MS", 3600000);
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function parsePositiveIntegerEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name] ?? String(fallback));
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return fallback;
+  }
+  return Math.floor(raw);
 }
 
 function expandHomePath(input: string): string {
@@ -288,12 +302,6 @@ function cancelAllPendingPermissions(record: AgentRecord): number {
   return count;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
 function isSubtaskTerminal(state: SubtaskState): boolean {
   return state === "done" || state === "error" || state === "cancelled";
 }
@@ -330,18 +338,61 @@ function refreshTaskState(task: TaskRecord): void {
     task.updatedAt = nowIso();
     return;
   }
-  if (task.subtasks.some((item) => item.state === "error")) {
-    task.state = "error";
+  if (task.subtasks.some((item) => item.state === "pending" || item.state === "running")) {
+    task.state = "running";
     task.updatedAt = nowIso();
     return;
   }
+
   if (task.subtasks.length > 0 && task.subtasks.every((item) => item.state === "done")) {
     task.state = "done";
-    task.updatedAt = nowIso();
+  } else if (
+    task.subtasks.some((item) => item.state === "error") &&
+    task.subtasks.every((item) => item.state === "done" || item.state === "error" || item.state === "cancelled")
+  ) {
+    task.state = "error";
+  } else if (task.subtasks.length > 0 && task.subtasks.every((item) => item.state === "cancelled")) {
+    task.state = "cancelled";
+  } else {
+    task.state = "running";
+  }
+  task.updatedAt = nowIso();
+}
+
+function isTaskTerminal(state: TaskState): boolean {
+  return state === "done" || state === "error" || state === "cancelled";
+}
+
+function taskUpdatedAtMs(task: TaskRecord): number {
+  const parsed = Date.parse(task.updatedAt);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return parsed;
+}
+
+function cleanupCompletedTasks(): void {
+  const now = Date.now();
+  const terminal = Array.from(tasks.values()).filter((task) => isTaskTerminal(task.state));
+  const expiryThreshold = now - TASK_TTL_MS;
+
+  for (const task of terminal) {
+    if (taskUpdatedAtMs(task) <= expiryThreshold) {
+      tasks.delete(task.id);
+    }
+  }
+
+  const remainingTerminal = Array.from(tasks.values())
+    .filter((task) => isTaskTerminal(task.state))
+    .sort((a, b) => taskUpdatedAtMs(a) - taskUpdatedAtMs(b));
+
+  const overflow = remainingTerminal.length - MAX_COMPLETED_TASKS;
+  if (overflow <= 0) {
     return;
   }
-  task.state = "running";
-  task.updatedAt = nowIso();
+  for (let i = 0; i < overflow; i += 1) {
+    tasks.delete(remainingTerminal[i].id);
+  }
 }
 
 function renderSubtaskPrompt(task: TaskRecord, subtask: TaskSubtaskRecord): string {
@@ -352,20 +403,31 @@ function renderSubtaskPrompt(task: TaskRecord, subtask: TaskSubtaskRecord): stri
 }
 
 async function runSubtask(task: TaskRecord, subtask: TaskSubtaskRecord): Promise<void> {
+  const abortPromise = task.cancelController.signal.aborted
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => {
+        task.cancelController.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+
   while (subtask.state === "pending") {
     if (task.cancelRequested || task.state === "cancelled") {
       const now = nowIso();
       subtask.state = "cancelled";
       subtask.updatedAt = now;
       subtask.completedAt = now;
+      subtask.resolveTerminal();
       refreshTaskState(task);
       return;
     }
     const dependencies = subtask.dependsOn.map((depId) => findTaskSubtask(task, depId)).filter(Boolean) as TaskSubtaskRecord[];
-    if (dependencies.every((dep) => isSubtaskTerminal(dep.state))) {
+    const unresolved = dependencies.filter((dep) => !isSubtaskTerminal(dep.state));
+    if (unresolved.length === 0) {
       break;
     }
-    await sleep(50);
+    await Promise.race([
+      abortPromise,
+      ...unresolved.map((dep) => dep.terminalPromise),
+    ]);
   }
 
   if (subtask.state !== "pending") {
@@ -380,7 +442,10 @@ async function runSubtask(task: TaskRecord, subtask: TaskSubtaskRecord): Promise
   task.updatedAt = startTime;
 
   try {
-    const result = await askAgent(subtask.agent, prompt);
+    const result = await askAgent(subtask.agent, prompt, undefined, {
+      taskId: task.id,
+      subtaskId: subtask.id,
+    });
     if (subtask.state !== "running") {
       return;
     }
@@ -390,7 +455,11 @@ async function runSubtask(task: TaskRecord, subtask: TaskSubtaskRecord): Promise
     subtask.error = null;
     subtask.updatedAt = doneAt;
     subtask.completedAt = doneAt;
+    subtask.resolveTerminal();
     refreshTaskState(task);
+    if (isTaskTerminal(task.state)) {
+      cleanupCompletedTasks();
+    }
   } catch (error) {
     if (subtask.state !== "running") {
       return;
@@ -400,7 +469,11 @@ async function runSubtask(task: TaskRecord, subtask: TaskSubtaskRecord): Promise
     subtask.error = error instanceof Error ? error.message : JSON.stringify(error) ?? String(error);
     subtask.updatedAt = errorAt;
     subtask.completedAt = errorAt;
+    subtask.resolveTerminal();
     refreshTaskState(task);
+    if (isTaskTerminal(task.state)) {
+      cleanupCompletedTasks();
+    }
   }
 }
 
@@ -412,9 +485,13 @@ async function runTask(taskId: string): Promise<void> {
   await Promise.allSettled(task.subtasks.map((subtask) => runSubtask(task, subtask)));
   if (task.state === "cancelled") {
     task.updatedAt = nowIso();
+    cleanupCompletedTasks();
     return;
   }
   refreshTaskState(task);
+  if (isTaskTerminal(task.state)) {
+    cleanupCompletedTasks();
+  }
 }
 
 function validateSubtaskGraph(subtasks: TaskSubtaskRecord[]): void {
@@ -494,6 +571,11 @@ function createTask(body: any): TaskRecord {
           .filter((item) => item.length > 0)
       : [];
 
+    let resolveTerminal: () => void = () => {};
+    const terminalPromise = new Promise<void>((resolve) => {
+      resolveTerminal = resolve;
+    });
+
     return {
       id,
       agent,
@@ -506,6 +588,8 @@ function createTask(body: any): TaskRecord {
       updatedAt: createdAt,
       startedAt: null,
       completedAt: null,
+      terminalPromise,
+      resolveTerminal,
     };
   });
 
@@ -519,6 +603,7 @@ function createTask(body: any): TaskRecord {
     createdAt,
     updatedAt: createdAt,
     cancelRequested: false,
+    cancelController: new AbortController(),
   };
   tasks.set(task.id, task);
   void runTask(task.id);
@@ -527,6 +612,7 @@ function createTask(body: any): TaskRecord {
 
 async function cancelTask(task: TaskRecord): Promise<{ cancelledSubtasks: number }> {
   task.cancelRequested = true;
+  task.cancelController.abort();
   task.state = "cancelled";
   task.updatedAt = nowIso();
 
@@ -539,6 +625,7 @@ async function cancelTask(task: TaskRecord): Promise<{ cancelledSubtasks: number
       subtask.state = "cancelled";
       subtask.updatedAt = cancelledAt;
       subtask.completedAt = cancelledAt;
+      subtask.resolveTerminal();
       cancelledSubtasks += 1;
       if (wasRunning) {
         cancelAgents.add(subtask.agent);
@@ -549,6 +636,9 @@ async function cancelTask(task: TaskRecord): Promise<{ cancelledSubtasks: number
   for (const agentName of cancelAgents) {
     const record = agents.get(agentName);
     if (!record) {
+      continue;
+    }
+    if (!record.activeTask || record.activeTask.taskId !== task.id) {
       continue;
     }
     try {
@@ -562,6 +652,8 @@ async function cancelTask(task: TaskRecord): Promise<{ cancelledSubtasks: number
       // best effort cancel
     }
   }
+
+  cleanupCompletedTasks();
 
   return { cancelledSubtasks };
 }
@@ -770,6 +862,7 @@ async function startAgent(input: {
     currentText: "",
     stopReason: null,
     pendingPermissions: [],
+    activeTask: null,
     createdAt: created,
     updatedAt: created,
   };
@@ -827,6 +920,7 @@ async function askAgent(
   name: string,
   prompt: string,
   onChunk?: (chunk: string) => void,
+  activeTask?: { taskId: string; subtaskId: string },
 ): Promise<AskResult> {
   const record = agents.get(name);
   if (!record) {
@@ -839,6 +933,7 @@ async function askAgent(
   record.updatedAt = nowIso();
   record.currentText = "";
   record.stopReason = null;
+  record.activeTask = activeTask ? { taskId: activeTask.taskId, subtaskId: activeTask.subtaskId } : null;
   const timeoutMs = parseAskTimeoutMs();
   const unsubscribe = onChunk ? subscribeChunks(name, onChunk) : null;
   let timeoutHandle: NodeJS.Timeout | null = null;
@@ -882,6 +977,14 @@ async function askAgent(
     }
     if (unsubscribe) {
       unsubscribe();
+    }
+    if (
+      !activeTask ||
+      (record.activeTask &&
+        record.activeTask.taskId === activeTask.taskId &&
+        record.activeTask.subtaskId === activeTask.subtaskId)
+    ) {
+      record.activeTask = null;
     }
   }
 }
@@ -1117,6 +1220,9 @@ function main(): void {
   const server = createServer((req, res) => {
     void handler(req, res);
   });
+  const cleanupInterval = setInterval(() => {
+    cleanupCompletedTasks();
+  }, 60000);
 
   server.on("error", (error: NodeJS.ErrnoException) => {
     if (error.code === "EADDRINUSE") {
@@ -1145,6 +1251,7 @@ function main(): void {
   });
 
   const shutdown = async () => {
+    clearInterval(cleanupInterval);
     for (const name of Array.from(agents.keys())) {
       await stopAgent(name);
     }
