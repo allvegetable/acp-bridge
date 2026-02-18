@@ -8,6 +8,13 @@ import * as acp from "@agentclientprotocol/sdk";
 
 type AgentState = "starting" | "idle" | "working" | "stopped" | "error";
 
+type PendingPermission = {
+  requestId: number;
+  params: acp.RequestPermissionRequest;
+  requestedAt: string;
+  resolve: (response: acp.RequestPermissionResponse) => void;
+};
+
 type AgentRecord = {
   name: string;
   cwd: string;
@@ -19,6 +26,7 @@ type AgentRecord = {
   lastText: string;
   currentText: string;
   stopReason: string | null;
+  pendingPermissions: PendingPermission[];
   createdAt: string;
   updatedAt: string;
 };
@@ -53,17 +61,19 @@ class BridgeClient implements acp.Client {
     params: acp.RequestPermissionRequest,
   ): Promise<acp.RequestPermissionResponse> {
     const record = this.getRecord();
-    if (record) {
-      record.updatedAt = new Date().toISOString();
-      record.state = "working";
+    if (!record) {
+      return { outcome: { outcome: "cancelled" } };
     }
-    // TODO(phase2): Replace auto-approve with explicit approve/deny workflow via HTTP API.
-    return {
-      outcome: {
-        outcome: "selected",
-        optionId: params.options[0]?.optionId ?? "deny",
-      } as any,
-    };
+    record.updatedAt = nowIso();
+    record.state = "working";
+    return new Promise((resolve) => {
+      record.pendingPermissions.push({
+        requestId: nextPermissionRequestId++,
+        params,
+        requestedAt: nowIso(),
+        resolve,
+      });
+    });
   }
 
   async sessionUpdate(params: acp.SessionNotification): Promise<void> {
@@ -94,6 +104,7 @@ class BridgeClient implements acp.Client {
 const agents = new Map<string, AgentRecord>();
 const bridgeConfig = loadConfig();
 const chunkSubscribers = new Map<string, Set<(chunk: string) => void>>();
+let nextPermissionRequestId = 1;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -171,9 +182,147 @@ function toStatus(record: AgentRecord) {
     lastError: record.lastError,
     lastText: record.lastText,
     stopReason: record.stopReason,
+    pendingPermissions: record.pendingPermissions.map((item) => ({
+      requestId: item.requestId,
+      requestedAt: item.requestedAt,
+      sessionId: item.params.sessionId,
+      options: item.params.options.map((option) => ({
+        optionId: option.optionId,
+        kind: option.kind,
+        name: option.name,
+      })),
+    })),
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
+}
+
+function findPermissionOptionId(
+  params: acp.RequestPermissionRequest,
+  mode: "approve" | "deny",
+  explicitOptionId?: string,
+): string | null {
+  if (explicitOptionId && params.options.some((option) => option.optionId === explicitOptionId)) {
+    return explicitOptionId;
+  }
+
+  if (mode === "approve") {
+    const preferred = params.options.find((option) => option.kind.startsWith("allow"));
+    if (preferred) {
+      return preferred.optionId;
+    }
+  } else {
+    const preferred = params.options.find((option) => option.kind.startsWith("reject"));
+    if (preferred) {
+      return preferred.optionId;
+    }
+  }
+
+  return params.options[0]?.optionId ?? null;
+}
+
+function resolvePendingPermission(
+  record: AgentRecord,
+  decision: "approve" | "deny" | "cancel",
+  explicitOptionId?: string,
+): PendingPermission | null {
+  const pending = record.pendingPermissions.shift();
+  if (!pending) {
+    return null;
+  }
+
+  if (decision === "cancel") {
+    pending.resolve({ outcome: { outcome: "cancelled" } });
+  } else {
+    const optionId = findPermissionOptionId(pending.params, decision, explicitOptionId);
+    if (optionId) {
+      pending.resolve({
+        outcome: {
+          outcome: "selected",
+          optionId,
+        },
+      });
+    } else {
+      pending.resolve({ outcome: { outcome: "cancelled" } });
+    }
+  }
+
+  record.updatedAt = nowIso();
+  return pending;
+}
+
+function cancelAllPendingPermissions(record: AgentRecord): number {
+  let count = 0;
+  while (resolvePendingPermission(record, "cancel")) {
+    count += 1;
+  }
+  return count;
+}
+
+async function spawnAgentConnection(input: {
+  name: string;
+  cwd: string;
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  getClient: () => acp.Client;
+}): Promise<{
+  child: ChildProcessWithoutNullStreams;
+  connection: acp.ClientSideConnection;
+  init: unknown;
+  session: any;
+}> {
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn(input.command, input.args, {
+      cwd: input.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: input.env,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new HttpError(400, `failed to spawn agent process: ${message}`);
+  }
+
+  const spawnError = new Promise<never>((_, reject) => {
+    child.once("error", (error) => {
+      reject(new HttpError(400, `failed to spawn agent process: ${error.message}`));
+    });
+  });
+
+  child.stderr.on("data", (data) => {
+    const record = agents.get(input.name);
+    if (record) {
+      record.updatedAt = nowIso();
+      record.lastError = data.toString("utf8").trim();
+    }
+  });
+
+  const stream = acp.ndJsonStream(
+    Writable.toWeb(child.stdin),
+    Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+  );
+  const connection = new acp.ClientSideConnection(input.getClient, stream);
+  try {
+    const init = await Promise.race([
+      connection.initialize({
+        protocolVersion: acp.PROTOCOL_VERSION,
+        clientCapabilities: {},
+      } as any),
+      spawnError,
+    ]);
+    const session = await Promise.race([
+      connection.newSession({
+        cwd: input.cwd,
+        mcpServers: [],
+      } as any),
+      spawnError,
+    ]);
+    return { child, connection, init, session };
+  } catch (error) {
+    child.kill("SIGTERM");
+    throw error;
+  }
 }
 
 function subscribeChunks(name: string, callback: (chunk: string) => void): () => void {
@@ -221,83 +370,70 @@ async function startAgent(input: {
 
   const cwd = input.cwd || process.cwd();
   const configuredAgent = bridgeConfig.agents?.[type];
-  let command = input.command || configuredAgent?.command || type;
   let defaultArgs: string[] = [];
   if (type === "opencode") {
-    command = input.command || configuredAgent?.command || "opencode";
     defaultArgs = ["acp"];
-  } else if (type === "codex") {
-    command = input.command || configuredAgent?.command || "codex";
-  } else if (type === "claude") {
-    command = input.command || configuredAgent?.command || "claude";
-  } else if (type === "gemini") {
-    command = input.command || configuredAgent?.command || "gemini";
   }
-  const args =
-    input.args && input.args.length > 0
-      ? input.args
-      : configuredAgent?.args && configuredAgent.args.length > 0
-        ? configuredAgent.args
-        : defaultArgs;
+  const configuredArgs = configuredAgent?.args && configuredAgent.args.length > 0 ? configuredAgent.args : undefined;
+  const requestedArgs = input.args && input.args.length > 0 ? input.args : undefined;
   const opencodeBin = `${homedir()}/.opencode/bin`;
   const currentPath = process.env.PATH || "";
   const childPath = currentPath ? `${opencodeBin}${delimiter}${currentPath}` : opencodeBin;
-  const finalCommand = expandHomePath(command);
   const finalEnv = {
     ...process.env,
     ...(configuredAgent?.env || {}),
     ...(input.env || {}),
     PATH: childPath,
   };
-  let child: ChildProcessWithoutNullStreams;
-  try {
-    child = spawn(finalCommand, args, {
-      cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: finalEnv,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new HttpError(400, `failed to spawn agent process: ${message}`);
-  }
-
-  const spawnError = new Promise<never>((_, reject) => {
-    child.once("error", (error) => {
-      reject(new HttpError(400, `failed to spawn agent process: ${error.message}`));
-    });
-  });
-
-  child.stderr.on("data", (data) => {
-    const record = agents.get(name);
-    if (record) {
-      record.updatedAt = nowIso();
-      record.lastError = data.toString("utf8").trim();
-    }
-  });
 
   let record: AgentRecord | undefined;
   const client = new BridgeClient(() => record);
-  const stream = acp.ndJsonStream(
-    Writable.toWeb(child.stdin),
-    Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
-  );
-  const connection = new acp.ClientSideConnection(() => client, stream);
+  const defaultCommand = input.command || configuredAgent?.command || type;
+  const defaultArgsList = requestedArgs || configuredArgs || defaultArgs;
+  const useCodexFallback =
+    type === "codex" &&
+    !input.command &&
+    !configuredAgent?.command &&
+    !requestedArgs &&
+    !configuredArgs;
+  const candidates = useCodexFallback
+    ? [
+        { command: "codex-acp", args: [] as string[] },
+        { command: "codex", args: ["mcp-server"] as string[] },
+      ]
+    : [{ command: defaultCommand, args: defaultArgsList }];
 
-  const init = await Promise.race([
-    connection.initialize({
-      protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {},
-    } as any),
-    spawnError,
-  ]);
+  let child: ChildProcessWithoutNullStreams | undefined;
+  let connection: acp.ClientSideConnection | undefined;
+  let init: unknown;
+  let session: any;
+  let lastError: unknown;
+
+  for (const candidate of candidates) {
+    try {
+      const result = await spawnAgentConnection({
+        name,
+        cwd,
+        command: expandHomePath(candidate.command),
+        args: candidate.args,
+        env: finalEnv,
+        getClient: () => client,
+      });
+      child = result.child;
+      connection = result.connection;
+      init = result.init;
+      session = result.session;
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!child || !connection || !session) {
+    throw lastError instanceof Error ? lastError : new HttpError(500, "failed to start agent");
+  }
+
   const created = nowIso();
-  const session = await Promise.race([
-    connection.newSession({
-      cwd,
-      mcpServers: [],
-    } as any),
-    spawnError,
-  ]);
 
   record = {
     name,
@@ -310,6 +446,7 @@ async function startAgent(input: {
     lastText: "",
     currentText: "",
     stopReason: null,
+    pendingPermissions: [],
     createdAt: created,
     updatedAt: created,
   };
@@ -320,6 +457,7 @@ async function startAgent(input: {
     if (!target) {
       return;
     }
+    cancelAllPendingPermissions(target);
     target.updatedAt = nowIso();
     target.state = target.state === "error" ? "error" : "stopped";
     target.lastError = target.lastError ?? `exit code=${code} signal=${signal}`;
@@ -337,6 +475,7 @@ async function stopAgent(name: string): Promise<boolean> {
     return false;
   }
   try {
+    cancelAllPendingPermissions(record);
     record.state = "stopped";
     record.updatedAt = nowIso();
     record.child.kill("SIGTERM");
@@ -457,6 +596,54 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
         return;
       }
       writeJson(res, 200, toStatus(record));
+      return;
+    }
+
+    if (
+      parts.length === 3 &&
+      parts[0] === "agents" &&
+      method === "POST" &&
+      (parts[2] === "approve" || parts[2] === "deny")
+    ) {
+      const record = agents.get(parts[1]);
+      if (!record) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      const body = await readJson(req);
+      const optionId = typeof body.optionId === "string" ? body.optionId : undefined;
+      const pending = resolvePendingPermission(record, parts[2], optionId);
+      if (!pending) {
+        writeJson(res, 409, { error: "no_pending_permissions" });
+        return;
+      }
+      writeJson(res, 200, {
+        ok: true,
+        name: record.name,
+        action: parts[2],
+        requestId: pending.requestId,
+        pendingPermissions: record.pendingPermissions.length,
+      });
+      return;
+    }
+
+    if (parts.length === 3 && parts[0] === "agents" && method === "POST" && parts[2] === "cancel") {
+      const record = agents.get(parts[1]);
+      if (!record) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      await record.connection.cancel({ sessionId: record.sessionId } as any);
+      const cancelledPermissions = cancelAllPendingPermissions(record);
+      record.updatedAt = nowIso();
+      if (record.state === "working") {
+        record.state = "idle";
+      }
+      writeJson(res, 200, {
+        ok: true,
+        name: record.name,
+        cancelledPermissions,
+      });
       return;
     }
 

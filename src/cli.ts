@@ -6,9 +6,10 @@ import { join } from "node:path";
 import { URL } from "node:url";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-type Command = "start" | "ask" | "status" | "list" | "stop" | "daemon";
+type Command = "start" | "ask" | "status" | "list" | "stop" | "approve" | "deny" | "cancel" | "daemon";
 type DaemonAction = "start" | "stop" | "status";
 type AskOptions = { name: string; prompt: string; stream: boolean };
+type PermissionActionOptions = { name: string; optionId?: string };
 
 const DEFAULT_BASE_URL = "http://localhost:7800";
 const PID_FILE = "/tmp/acp-bridge.pid";
@@ -48,11 +49,14 @@ function parseArgs(argv: string[]): { baseUrl: string; command: Command; args: s
         "status <name>",
         "list",
         "stop <name>",
+        "approve <name> [--option <optionId>]",
+        "deny <name> [--option <optionId>]",
+        "cancel <name>",
         "daemon start|stop|status",
       ],
     });
   }
-  if (!["start", "ask", "status", "list", "stop", "daemon"].includes(command)) {
+  if (!["start", "ask", "status", "list", "stop", "approve", "deny", "cancel", "daemon"].includes(command)) {
     printError(`unknown command: ${command}`);
   }
 
@@ -200,6 +204,30 @@ function parseAskArgs(args: string[]): AskOptions {
     printError("ask requires <prompt>");
   }
   return { name, prompt, stream };
+}
+
+function parsePermissionActionArgs(args: string[], action: "approve" | "deny"): PermissionActionOptions {
+  const name = args.shift();
+  if (!name) {
+    printError(`${action} requires <name>`);
+  }
+  let optionId: string | undefined;
+  while (args.length > 0) {
+    const token = args.shift();
+    if (!token) {
+      continue;
+    }
+    if (token === "--option") {
+      const value = args.shift();
+      if (!value) {
+        printError(`missing value for --option`);
+      }
+      optionId = value;
+      continue;
+    }
+    printError(`unknown ${action} option: ${token}`);
+  }
+  return { name, optionId };
 }
 
 function requestJson(
@@ -439,6 +467,15 @@ async function main(): Promise<void> {
         printError("stop requires <name>");
       }
       result = await requestJson(baseUrl, "DELETE", `/agents/${encodeURIComponent(name)}`);
+    } else if (command === "approve" || command === "deny") {
+      const parsed = parsePermissionActionArgs(rest, command);
+      result = await requestJson(baseUrl, "POST", `/agents/${encodeURIComponent(parsed.name)}/${command}`, parsed.optionId ? { optionId: parsed.optionId } : undefined);
+    } else if (command === "cancel") {
+      const name = rest.shift();
+      if (!name) {
+        printError("cancel requires <name>");
+      }
+      result = await requestJson(baseUrl, "POST", `/agents/${encodeURIComponent(name)}/cancel`);
     }
 
     printJson(result ?? { ok: true });

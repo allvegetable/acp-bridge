@@ -42,6 +42,8 @@ node dist/cli.js daemon start
 
 # In another terminal — start an agent
 node dist/cli.js --url http://localhost:7800 start opencode --name my-agent --cwd ~/my-project
+# Codex (Phase 2): tries `codex-acp`, falls back to `codex mcp-server`
+node dist/cli.js --url http://localhost:7800 start codex --name codex-agent --cwd ~/my-project
 
 # Send a prompt and get a structured response
 node dist/cli.js --url http://localhost:7800 ask my-agent "refactor the auth module"
@@ -58,6 +60,11 @@ node dist/cli.js --url http://localhost:7800 list
 
 # Stop an agent
 node dist/cli.js --url http://localhost:7800 stop my-agent
+
+# Approve / deny / cancel (permission + session control)
+node dist/cli.js --url http://localhost:7800 approve my-agent
+node dist/cli.js --url http://localhost:7800 deny my-agent
+node dist/cli.js --url http://localhost:7800 cancel my-agent
 
 # daemon control
 node dist/cli.js daemon status
@@ -110,6 +117,9 @@ The daemon exposes a simple REST API:
 | `GET` | `/agents/:name` | Get agent status |
 | `POST` | `/agents/:name/ask` | Send prompt, wait for response |
 | `POST` | `/agents/:name/ask?stream=true` | SSE stream chunks and final result |
+| `POST` | `/agents/:name/approve` | Approve the next pending permission request |
+| `POST` | `/agents/:name/deny` | Deny the next pending permission request |
+| `POST` | `/agents/:name/cancel` | Cancel current session work (`session/cancel`) |
 | `DELETE` | `/agents/:name` | Stop an agent |
 
 ## Roadmap
