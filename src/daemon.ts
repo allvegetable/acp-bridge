@@ -402,6 +402,12 @@ async function startAgent(input: {
     !configuredAgent?.command &&
     !requestedArgs &&
     !configuredArgs;
+  const useGeminiDefault =
+    type === "gemini" &&
+    !input.command &&
+    !configuredAgent?.command &&
+    !requestedArgs &&
+    !configuredArgs;
   const candidates = useCodexFallback
     ? [
         { command: "codex-acp", args: [] as string[] },
@@ -409,7 +415,9 @@ async function startAgent(input: {
       ]
     : useClaudeDefault
       ? [{ command: "claude-agent-acp", args: [] as string[] }]
-      : [{ command: defaultCommand, args: defaultArgsList }];
+      : useGeminiDefault
+        ? [{ command: "gemini", args: ["--experimental-acp"] as string[] }]
+        : [{ command: defaultCommand, args: defaultArgsList }];
 
   let child: ChildProcessWithoutNullStreams | undefined;
   let connection: acp.ClientSideConnection | undefined;
@@ -558,7 +566,7 @@ async function askAgent(
       throw error;
     }
     record.state = "error";
-    record.lastError = error instanceof Error ? error.message : String(error);
+    record.lastError = error instanceof Error ? error.message : JSON.stringify(error) ?? String(error);
     record.updatedAt = nowIso();
     throw error;
   } finally {
@@ -712,7 +720,7 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
       });
       return;
     }
-    const message = error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : JSON.stringify(error) ?? String(error);
     writeJson(res, 500, { error: message });
   }
 }
