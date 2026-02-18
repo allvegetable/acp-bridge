@@ -46,6 +46,8 @@ node dist/cli.js --url http://localhost:7800 start opencode --name my-agent --cw
 node dist/cli.js --url http://localhost:7800 start codex --name codex-agent --cwd ~/my-project
 # Claude (Phase 2): uses `claude-agent-acp` adapter
 node dist/cli.js --url http://localhost:7800 start claude --name claude-agent --cwd ~/my-project
+# Gemini (Phase 2): uses `gemini --experimental-acp`
+node dist/cli.js --url http://localhost:7800 start gemini --name gemini-agent --cwd ~/my-project
 
 # Send a prompt and get a structured response
 node dist/cli.js --url http://localhost:7800 ask my-agent "refactor the auth module"
@@ -104,6 +106,14 @@ Create `~/.config/acp-bridge/config.json`:
       "env": {
         "OPENAI_API_KEY": "your-key"
       }
+    },
+    "gemini": {
+      "command": "gemini",
+      "args": ["--experimental-acp"],
+      "env": {
+        "GEMINI_API_KEY": "your-key",
+        "GOOGLE_GEMINI_BASE_URL": "https://generativelanguage.googleapis.com"
+      }
     }
   }
 }
@@ -118,7 +128,7 @@ Environment variables like `ACP_BRIDGE_PORT` and `ACP_BRIDGE_HOST` still overrid
 | [OpenCode](https://opencode.ai) | ✅ Working | Native | `opencode acp` — built-in ACP support |
 | [Codex CLI](https://github.com/openai/codex) | ✅ Working | [codex-acp](https://github.com/cola-io/codex-acp) | Third-party adapter, patched for Codex 0.101.0 |
 | [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) | ✅ Working | [claude-agent-acp](https://www.npmjs.com/package/@zed-industries/claude-agent-acp) | Zed's official ACP adapter wrapping Claude Agent SDK |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | 🔜 Planned | Native | Has built-in ACP support |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | ✅ Working | Native | `gemini --experimental-acp` — built-in ACP support |
 
 ### Adapter Details
 
@@ -133,6 +143,9 @@ Each agent type uses a different path to speak ACP over stdio:
 │              │     └──────────────────┘     └─────────┘
 │              │     ┌──────────────────┐     ┌─────────┐
 │              │────▶│ claude-agent-acp │────▶│Anthropic│
+│              │     └──────────────────┘     └─────────┘
+│              │     ┌──────────────────┐     ┌─────────┐
+│              │────▶│ gemini --exp-acp │────▶│ Google  │
 └─────────────┘     └──────────────────┘     └─────────┘
 ```
 
@@ -146,6 +159,15 @@ Required environment variables for Claude:
 ```bash
 ANTHROPIC_API_KEY="your-key"          # or use ANTHROPIC_AUTH_TOKEN
 ANTHROPIC_BASE_URL="https://api.anthropic.com"  # optional, for proxy/custom endpoints
+```
+
+**Gemini CLI** — Native ACP support via `gemini --experimental-acp`. Install with `npm install -g @google/gemini-cli`. The daemon spawns `gemini --experimental-acp` over stdio. Like claude-agent-acp, it uses ACP protocol version `1` (numeric).
+
+Required environment variables for Gemini:
+```bash
+GEMINI_API_KEY="your-key"
+GOOGLE_GEMINI_BASE_URL="https://generativelanguage.googleapis.com"  # optional, for proxy
+# Note: do NOT include /v1 suffix — the SDK appends /v1beta/ automatically
 ```
 
 ## API
@@ -168,7 +190,7 @@ The daemon exposes a simple REST API:
 ## Roadmap
 
 - [x] Phase 1: Daemon + CLI + OpenCode support
-- [x] Phase 2: Codex CLI support (codex-acp 0.101.0), Claude CLI support (claude-agent-acp), permission approve/deny, task cancel
+- [x] Phase 2: Codex CLI support (codex-acp 0.101.0), Claude CLI support (claude-agent-acp), Gemini CLI support (native ACP), permission approve/deny, task cancel
 - [ ] Phase 3: Parallel multi-agent tasks, task dependency chains, result caching
 - [ ] Phase 4: OpenClaw skill integration, npm publish
 
