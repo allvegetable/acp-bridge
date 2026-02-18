@@ -2,7 +2,7 @@
 
 A daemon + CLI tool that manages coding agents (like [OpenCode](https://opencode.ai), Codex CLI, Claude CLI) through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) — replacing fragile tmux screen-scraping with structured JSON-RPC communication.
 
-> ⚠️ **Early stage** — This project is under active development. APIs may change.
+> ⚠️ **Early stage** — This project is under active development. Phase 1 & 2 complete, Phase 3 in progress.
 
 ## Why
 
@@ -101,7 +101,7 @@ Environment variables like `ACP_BRIDGE_PORT` and `ACP_BRIDGE_HOST` still overrid
 | Agent | Status | Notes |
 |-------|--------|-------|
 | [OpenCode](https://opencode.ai) | ✅ Working | Native ACP support via `opencode acp` |
-| [Codex CLI](https://github.com/openai/codex) | 🔜 Planned | Needs [codex-acp](https://github.com/cola-io/codex-acp) adapter |
+| [Codex CLI](https://github.com/openai/codex) | ✅ Working | Via [codex-acp](https://github.com/cola-io/codex-acp) adapter (patched for 0.101.0) |
 | [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) | 🔜 Planned | Needs Zed SDK adapter |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | 🔜 Planned | Native ACP support |
 
@@ -125,8 +125,8 @@ The daemon exposes a simple REST API:
 ## Roadmap
 
 - [x] Phase 1: Daemon + CLI + OpenCode support
-- [ ] Phase 2: Codex CLI + Claude CLI support, permission approval flow
-- [ ] Phase 3: Async tasks, parallel agents, task dependencies
+- [x] Phase 2: Codex CLI support (codex-acp 0.101.0), permission approve/deny, task cancel
+- [ ] Phase 3: Parallel multi-agent tasks, task dependency chains, result caching
 - [ ] Phase 4: OpenClaw skill integration, npm publish
 
 ## Related
