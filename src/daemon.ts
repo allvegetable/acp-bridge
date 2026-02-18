@@ -396,12 +396,20 @@ async function startAgent(input: {
     !configuredAgent?.command &&
     !requestedArgs &&
     !configuredArgs;
+  const useClaudeDefault =
+    type === "claude" &&
+    !input.command &&
+    !configuredAgent?.command &&
+    !requestedArgs &&
+    !configuredArgs;
   const candidates = useCodexFallback
     ? [
         { command: "codex-acp", args: [] as string[] },
         { command: "codex", args: ["mcp-server"] as string[] },
       ]
-    : [{ command: defaultCommand, args: defaultArgsList }];
+    : useClaudeDefault
+      ? [{ command: "claude-agent-acp", args: [] as string[] }]
+      : [{ command: defaultCommand, args: defaultArgsList }];
 
   let child: ChildProcessWithoutNullStreams | undefined;
   let connection: acp.ClientSideConnection | undefined;
@@ -463,7 +471,7 @@ async function startAgent(input: {
     target.lastError = target.lastError ?? `exit code=${code} signal=${signal}`;
   });
 
-  if ((init as any).protocolVersion !== acp.PROTOCOL_VERSION) {
+  if ((init as any).protocolVersion !== acp.PROTOCOL_VERSION && (init as any).protocolVersion !== 1) {
     record.lastError = `protocol mismatch: ${(init as any).protocolVersion}`;
   }
   return record;
