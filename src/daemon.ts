@@ -293,24 +293,36 @@ function apiKeyFormatStatus(type: string, env: Record<string, string | undefined
 
 function classifyAskError(error: unknown): string {
   const message = error instanceof Error ? error.message : JSON.stringify(error) ?? String(error);
-  const statusMatch = message.match(/\b(401|403|429|503)\b/);
+  const statusMatch = message.match(/\b(401|403|429|500|502|503|504)\b/);
   if (statusMatch) {
     const code = Number(statusMatch[1]);
     if (code === 401 || code === 403) {
-      return "API key invalid or expired. Check your key.";
+      return `[${code}] API key invalid or expired. Check your key. (${message})`;
     }
     if (code === 429) {
-      return "Rate limited. Check proxy quota.";
+      return `[429] Rate limited. Check proxy quota. (${message})`;
+    }
+    if (code === 500) {
+      return `[500] Upstream server error. Likely a proxy or model issue, not local config. (${message})`;
+    }
+    if (code === 502) {
+      return `[502] Bad gateway. Proxy failed to reach upstream. (${message})`;
     }
     if (code === 503) {
-      return "Service unavailable. Check proxy status.";
+      return `[503] Service unavailable. Check proxy status. (${message})`;
+    }
+    if (code === 504) {
+      return `[504] Gateway timeout. Proxy or upstream too slow. (${message})`;
     }
   }
   if (message.includes("ECONNREFUSED")) {
-    return "Connection refused. Check base URL.";
+    return `[ECONNREFUSED] Connection refused. Check base URL. (${message})`;
   }
   if (message.includes("ENOTFOUND")) {
-    return "DNS resolution failed. Check network.";
+    return `[ENOTFOUND] DNS resolution failed. Check network. (${message})`;
+  }
+  if (message.includes("ETIMEDOUT") || message.includes("timeout")) {
+    return `[TIMEOUT] Request timed out. Check network or proxy. (${message})`;
   }
   return message;
 }
