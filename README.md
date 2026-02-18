@@ -2,7 +2,7 @@
 
 A daemon + CLI tool that manages coding agents (like [OpenCode](https://opencode.ai), Codex CLI, Claude CLI) through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) — replacing fragile tmux screen-scraping with structured JSON-RPC communication.
 
-> ⚠️ **Early stage** — This project is under active development. Phase 1 & 2 complete, Phase 3 in progress.
+> ⚠️ **Early stage** — This project is under active development. Phase 1 & 2 complete (OpenCode + Codex + Claude), Phase 3 in progress.
 
 ## Why
 
@@ -44,6 +44,8 @@ node dist/cli.js daemon start
 node dist/cli.js --url http://localhost:7800 start opencode --name my-agent --cwd ~/my-project
 # Codex (Phase 2): tries `codex-acp`, falls back to `codex mcp-server`
 node dist/cli.js --url http://localhost:7800 start codex --name codex-agent --cwd ~/my-project
+# Claude (Phase 2): uses `claude-agent-acp` adapter
+node dist/cli.js --url http://localhost:7800 start claude --name claude-agent --cwd ~/my-project
 
 # Send a prompt and get a structured response
 node dist/cli.js --url http://localhost:7800 ask my-agent "refactor the auth module"
@@ -89,6 +91,19 @@ Create `~/.config/acp-bridge/config.json`:
         "OPENAI_API_KEY": "your-key",
         "OPENAI_BASE_URL": "https://api.openai.com/v1"
       }
+    },
+    "claude": {
+      "command": "claude-agent-acp",
+      "env": {
+        "ANTHROPIC_API_KEY": "your-key",
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+      }
+    },
+    "codex": {
+      "command": "codex-acp",
+      "env": {
+        "OPENAI_API_KEY": "your-key"
+      }
     }
   }
 }
@@ -98,12 +113,40 @@ Environment variables like `ACP_BRIDGE_PORT` and `ACP_BRIDGE_HOST` still overrid
 
 ## Supported Agents
 
-| Agent | Status | Notes |
-|-------|--------|-------|
-| [OpenCode](https://opencode.ai) | ✅ Working | Native ACP support via `opencode acp` |
-| [Codex CLI](https://github.com/openai/codex) | ✅ Working | Via [codex-acp](https://github.com/cola-io/codex-acp) adapter (patched for 0.101.0) |
-| [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) | 🔜 Planned | Needs Zed SDK adapter |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | 🔜 Planned | Native ACP support |
+| Agent | Status | Adapter | Notes |
+|-------|--------|---------|-------|
+| [OpenCode](https://opencode.ai) | ✅ Working | Native | `opencode acp` — built-in ACP support |
+| [Codex CLI](https://github.com/openai/codex) | ✅ Working | [codex-acp](https://github.com/cola-io/codex-acp) | Third-party adapter, patched for Codex 0.101.0 |
+| [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) | ✅ Working | [claude-agent-acp](https://www.npmjs.com/package/@zed-industries/claude-agent-acp) | Zed's official ACP adapter wrapping Claude Agent SDK |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | 🔜 Planned | Native | Has built-in ACP support |
+
+### Adapter Details
+
+Each agent type uses a different path to speak ACP over stdio:
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────┐
+│  acp-bridge  │────▶│  opencode acp    │────▶│ LLM API │
+│  daemon      │     └──────────────────┘     └─────────┘
+│              │     ┌──────────────────┐     ┌─────────┐
+│              │────▶│  codex-acp       │────▶│ OpenAI  │
+│              │     └──────────────────┘     └─────────┘
+│              │     ┌──────────────────┐     ┌─────────┐
+│              │────▶│ claude-agent-acp │────▶│Anthropic│
+└─────────────┘     └──────────────────┘     └─────────┘
+```
+
+**OpenCode** — Native ACP. Just works with `opencode acp`.
+
+**Codex CLI** — Uses [codex-acp](https://github.com/cola-io/codex-acp), a Rust adapter that wraps the Codex CLI library as an ACP agent. We pin to the `rust-v0.101.0` revision to match Codex CLI 0.101.0. The daemon tries `codex-acp` first, then falls back to `codex mcp-server`.
+
+**Claude CLI** — Uses [@zed-industries/claude-agent-acp](https://www.npmjs.com/package/@zed-industries/claude-agent-acp) (v0.17.1), Zed's official adapter that wraps the Claude Agent SDK as a standard ACP agent. Install with `npm install -g @zed-industries/claude-agent-acp`. Note: this adapter uses ACP protocol version `1` (numeric) instead of the date-string format used by other agents — acp-bridge handles both transparently.
+
+Required environment variables for Claude:
+```bash
+ANTHROPIC_API_KEY="your-key"          # or use ANTHROPIC_AUTH_TOKEN
+ANTHROPIC_BASE_URL="https://api.anthropic.com"  # optional, for proxy/custom endpoints
+```
 
 ## API
 
@@ -125,7 +168,7 @@ The daemon exposes a simple REST API:
 ## Roadmap
 
 - [x] Phase 1: Daemon + CLI + OpenCode support
-- [x] Phase 2: Codex CLI support (codex-acp 0.101.0), permission approve/deny, task cancel
+- [x] Phase 2: Codex CLI support (codex-acp 0.101.0), Claude CLI support (claude-agent-acp), permission approve/deny, task cancel
 - [ ] Phase 3: Parallel multi-agent tasks, task dependency chains, result caching
 - [ ] Phase 4: OpenClaw skill integration, npm publish
 
@@ -133,7 +176,8 @@ The daemon exposes a simple REST API:
 
 - [ACP Protocol](https://agentclientprotocol.com) — The standard this project builds on
 - [agent-team](https://github.com/nekocode/agent-team) — Multi-agent CLI orchestrator (standalone)
-- [codex-acp](https://github.com/cola-io/codex-acp) — Codex CLI ACP adapter
+- [codex-acp](https://github.com/cola-io/codex-acp) — Codex CLI ACP adapter (Rust)
+- [claude-agent-acp](https://www.npmjs.com/package/@zed-industries/claude-agent-acp) — Claude CLI ACP adapter by Zed Industries
 
 ## License
 
