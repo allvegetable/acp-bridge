@@ -1,7 +1,7 @@
 {
   "name": "acp-bridge",
   "version": "0.3.0",
-  "description": "Daemon + CLI that manages coding agents (OpenCode, Codex, Claude, Gemini) through the Agent Client Protocol (ACP)",
+  "description": "Multi-agent orchestrator for OpenClaw. Manages coding agents (Codex, Claude, Gemini, OpenCode) via Agent Client Protocol (ACP)",
   "main": "dist/daemon.js",
   "bin": {
     "acp-bridge": "dist/cli.js",
@@ -13,6 +13,7 @@
     "daemon": "node dist/daemon.js"
   },
   "keywords": [
+    "openclaw",
     "acp",
     "agent-client-protocol",
     "coding-agent",
