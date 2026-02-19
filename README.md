@@ -1,10 +1,10 @@
 # ACP Bridge v0.3.0
 
-A daemon + CLI for orchestrating ACP-compatible coding agents ([OpenCode](https://opencode.ai), [Codex CLI](https://github.com/openai/codex), [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli)) with structured JSON-RPC, multi-agent task execution, and a built-in diagnostics system.
+Multi-agent orchestrator for [OpenClaw](https://openclaw.ai) and other AI platforms. Manages coding agents ([OpenCode](https://opencode.ai), [Codex CLI](https://github.com/openai/codex), [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli)) through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) — structured JSON-RPC over stdio, multi-agent task execution, dependency chains, and built-in diagnostics.
 
 ## Why
 
-If you orchestrate multiple AI coding agents, you've probably resorted to tmux `send-keys` / `capture-pane` hacks. That approach is:
+If you use [OpenClaw](https://openclaw.ai) or orchestrate multiple AI coding agents, you've probably resorted to tmux `send-keys` / `capture-pane` hacks. That approach is:
 
 - **Wasteful** - polling burns tokens on non-semantic terminal output
 - **Fragile** - ANSI escape codes, progress bars, rendering artifacts
@@ -23,6 +23,27 @@ opencode / codex / claude / gemini (ACP mode)
     ↓
 LLM API
 ```
+
+### OpenClaw Integration
+
+ACP Bridge is designed to work with [OpenClaw](https://openclaw.ai) — an autonomous AI agent platform. OpenClaw agents can use ACP Bridge to dispatch coding tasks to multiple coding agents (Codex, Claude, Gemini) in parallel, with full permission control and diagnostics.
+
+```text
+OpenClaw Agent (e.g. Otacon, Raiden)
+    ↓ HTTP (localhost:7800)
+ACP Bridge Daemon
+    ↓ ACP over stdio
+codex / claude / gemini
+    ↓
+LLM APIs (OpenAI, Anthropic, Google)
+```
+
+Typical workflow:
+1. OpenClaw agent starts ACP Bridge daemon
+2. Spawns coding agents as needed (`start codex`, `start claude`, etc.)
+3. Sends tasks via `ask` or creates multi-agent task graphs via `/tasks`
+4. Monitors progress, approves/denies permissions, handles errors
+5. Uses `doctor` and `diagnose` for automated troubleshooting
 
 ## Installation
 
