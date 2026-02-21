@@ -15,6 +15,7 @@ type Command =
   | "approve"
   | "deny"
   | "cancel"
+  | "mode"
   | "daemon"
   | "task"
   | "doctor";
@@ -61,7 +62,7 @@ function parseArgs(argv: string[]): { baseUrl: string; command: Command; args: s
   if (!command) {
     printError("missing command", {
       usage: [
-        "start <type> --name <name> [--cwd <path>]",
+        "start <type> --name <name> [--cwd <path>] [--mode <mode>]",
         "ask <name> [--stream] <prompt>",
         "status <name>",
         "list",
@@ -69,6 +70,7 @@ function parseArgs(argv: string[]): { baseUrl: string; command: Command; args: s
         "approve <name> [--option <optionId>]",
         "deny <name> [--option <optionId>]",
         "cancel <name>",
+        "mode <name> <mode>",
         "daemon start|stop|status",
         "doctor",
         "task create <json>",
@@ -78,7 +80,7 @@ function parseArgs(argv: string[]): { baseUrl: string; command: Command; args: s
       ],
     });
   }
-  if (!["start", "ask", "status", "list", "stop", "approve", "deny", "cancel", "daemon", "task", "doctor"].includes(command)) {
+  if (!["start", "ask", "status", "list", "stop", "approve", "deny", "cancel", "mode", "daemon", "task", "doctor"].includes(command)) {
     printError(`unknown command: ${command}`);
   }
 
@@ -163,7 +165,7 @@ function daemonStatus(): unknown {
   return { ok: true, daemon: "running", pid };
 }
 
-function parseStartArgs(args: string[]): { type: string; name: string; cwd?: string } {
+function parseStartArgs(args: string[]): { type: string; name: string; cwd?: string; mode?: string } {
   const type = args.shift();
   if (!type) {
     printError("start requires <type>");
@@ -171,6 +173,7 @@ function parseStartArgs(args: string[]): { type: string; name: string; cwd?: str
 
   let name: string | undefined;
   let cwd: string | undefined;
+  let mode: string | undefined;
 
   while (args.length > 0) {
     const token = args.shift();
@@ -196,6 +199,15 @@ function parseStartArgs(args: string[]): { type: string; name: string; cwd?: str
       continue;
     }
 
+    if (token === "--mode") {
+      const value = args.shift();
+      if (!value) {
+        printError("missing value for --mode (e.g. full-access, auto, read-only)");
+      }
+      mode = value;
+      continue;
+    }
+
     printError(`unknown start option: ${token}`);
   }
 
@@ -203,7 +215,7 @@ function parseStartArgs(args: string[]): { type: string; name: string; cwd?: str
     printError("start requires --name <name>");
   }
 
-  return { type, name, cwd };
+  return { type, name, cwd, mode };
 }
 
 function parseAskArgs(args: string[]): AskOptions {
@@ -529,11 +541,27 @@ async function main(): Promise<void> {
 
     if (command === "start") {
       const parsed = parseStartArgs(rest);
-      result = await requestJson(baseUrl, "POST", "/agents", {
+      const body: Record<string, JsonValue> = {
         type: parsed.type,
         name: parsed.name,
-        cwd: parsed.cwd,
-      });
+      };
+      if (parsed.cwd) {
+        body.cwd = parsed.cwd;
+      }
+      if (parsed.mode) {
+        body.mode = parsed.mode;
+      }
+      result = await requestJson(baseUrl, "POST", "/agents", body);
+    } else if (command === "mode") {
+      const name = rest.shift();
+      if (!name) {
+        printError("mode requires <name>");
+      }
+      const mode = rest.shift();
+      if (!mode) {
+        printError("mode requires <mode> (e.g. full-access, auto, read-only)");
+      }
+      result = await requestJson(baseUrl, "POST", `/agents/${encodeURIComponent(name)}/mode`, { mode });
     } else if (command === "daemon") {
       const action = parseDaemonAction(rest);
       if (action === "start") {

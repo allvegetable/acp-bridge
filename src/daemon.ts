@@ -49,6 +49,7 @@ type AgentConfig = {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
+  mode?: string;
 };
 
 type BridgeConfig = {
@@ -1002,6 +1003,7 @@ async function startAgent(input: {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
+  mode?: string;
 }): Promise<AgentRecord> {
   const type = input.type?.trim() || "opencode";
   const name = input.name?.trim();
@@ -1104,6 +1106,20 @@ async function startAgent(input: {
 
   if (!child || !connection || !session) {
     throw lastError instanceof Error ? lastError : new HttpError(500, "failed to start agent");
+  }
+
+  // Set session mode if requested (e.g. "full-access" for write permissions)
+  const requestedMode = input.mode || configuredAgent?.mode;
+  if (requestedMode && connection) {
+    try {
+      await connection.setSessionMode({
+        sessionId: (session as any).sessionId,
+        modeId: requestedMode,
+      } as any);
+    } catch (modeError: any) {
+      // Non-fatal: agent may not support setSessionMode
+      console.error(`[${name}] setSessionMode("${requestedMode}") failed: ${modeError?.message || modeError}`);
+    }
   }
 
   const created = nowIso();
@@ -1441,6 +1457,30 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
         requestId: pending.requestId,
         pendingPermissions: record.pendingPermissions.length,
       });
+      return;
+    }
+
+    if (parts.length === 3 && parts[0] === "agents" && method === "POST" && parts[2] === "mode") {
+      const record = agents.get(parts[1]);
+      if (!record) {
+        writeJson(res, 404, { error: "not_found" });
+        return;
+      }
+      const body = await readJson(req);
+      const mode = typeof body.mode === "string" ? body.mode : undefined;
+      if (!mode) {
+        writeJson(res, 400, { error: "missing 'mode' field (e.g. 'full-access', 'auto', 'read-only')" });
+        return;
+      }
+      try {
+        await record.connection.setSessionMode({
+          sessionId: record.sessionId,
+          modeId: mode,
+        } as any);
+        writeJson(res, 200, { ok: true, name: record.name, mode });
+      } catch (err: any) {
+        writeJson(res, 500, { error: `setSessionMode failed: ${err?.message || err}` });
+      }
       return;
     }
 
