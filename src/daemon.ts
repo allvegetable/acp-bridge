@@ -2,8 +2,9 @@
 import { execSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { URL as NodeURL } from "node:url";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -1025,12 +1026,25 @@ async function startAgent(input: {
   const opencodeBin = `${homedir()}/.opencode/bin`;
   const currentPath = process.env.PATH || "";
   const childPath = currentPath ? `${opencodeBin}${delimiter}${currentPath}` : opencodeBin;
-  const finalEnv = {
+  const finalEnv: Record<string, string | undefined> = {
     ...process.env,
     ...(configuredAgent?.env || {}),
     ...(input.env || {}),
     PATH: childPath,
   };
+
+  // For codex agents: redirect to model-rewrite proxy to strip "openai@" prefix
+  if (type === "codex" && modelRewriteProxyPort) {
+    finalEnv.OPENAI_BASE_URL = `http://127.0.0.1:${modelRewriteProxyPort}`;
+    // The rewrite proxy handles upstream proxying itself,
+    // so codex should connect directly to the local proxy without going through HTTP_PROXY
+    finalEnv.HTTP_PROXY = "";
+    finalEnv.HTTPS_PROXY = "";
+    finalEnv.http_proxy = "";
+    finalEnv.https_proxy = "";
+    finalEnv.NO_PROXY = "*";
+    finalEnv.no_proxy = "*";
+  }
 
   let record: AgentRecord | undefined;
   const stderrBuffer: string[] = [];
@@ -1057,8 +1071,8 @@ async function startAgent(input: {
     !configuredArgs;
   const candidates = useCodexFallback
     ? [
-        { command: "codex-acp", args: [] as string[] },
         { command: "codex", args: ["mcp-server"] as string[] },
+        { command: "codex-acp", args: [] as string[] },
       ]
     : useClaudeDefault
       ? [{ command: "claude-agent-acp", args: [] as string[] }]
@@ -1640,6 +1654,89 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
   }
 }
 
+// --- Model name rewrite proxy ---
+// codex-acp and codex mcp-server prepend "openai@" to model names,
+// which breaks third-party OpenAI-compatible APIs.
+// This embedded proxy strips the provider prefix before forwarding.
+
+let modelRewriteProxyPort: number | null = null;
+let modelRewriteProxyServer: Server | null = null;
+
+function stripModelPrefix(model: string): string {
+  // "openai@gpt-5.3-codex" -> "gpt-5.3-codex"
+  // "openai@manyrouter@gpt-5.3-codex" -> "gpt-5.3-codex"
+  if (!model.includes("@")) return model;
+  const parts = model.split("@");
+  return parts[parts.length - 1];
+}
+
+function startModelRewriteProxy(realBaseUrl: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const parsed = new NodeURL(realBaseUrl);
+    const useHttps = parsed.protocol === "https:";
+
+    const proxy = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        let body = Buffer.concat(chunks);
+        const ct = req.headers["content-type"] || "";
+
+        // Rewrite model name in JSON body
+        if (ct.includes("json") && body.length > 0) {
+          try {
+            const json = JSON.parse(body.toString());
+            if (json.model && json.model.includes("@")) {
+              json.model = stripModelPrefix(json.model);
+            }
+            body = Buffer.from(JSON.stringify(json));
+          } catch {
+            // not valid JSON, forward as-is
+          }
+        }
+
+        const targetPath = (parsed.pathname === "/" ? "" : parsed.pathname) + (req.url || "");
+        const headers: Record<string, string | number | undefined> = {};
+        // Copy relevant headers
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (k === "host" || k === "connection" || k === "transfer-encoding") continue;
+          headers[k] = v as string;
+        }
+        headers["host"] = parsed.host;
+        headers["content-length"] = body.length;
+
+        const proto = useHttps ? httpsRequest : httpRequest;
+        const fwdReq = proto({
+          hostname: parsed.hostname,
+          port: parsed.port || (useHttps ? 443 : 80),
+          path: targetPath,
+          method: req.method,
+          headers,
+        }, (fwdRes) => {
+          res.writeHead(fwdRes.statusCode || 502, fwdRes.headers);
+          fwdRes.pipe(res);
+        });
+        fwdReq.on("error", (err) => {
+          if (!res.headersSent) res.writeHead(502);
+          res.end(JSON.stringify({ error: `forward error: ${err.message}` }));
+        });
+        fwdReq.write(body);
+        fwdReq.end();
+      });
+    });
+
+    // Listen on random available port
+    proxy.listen(0, "127.0.0.1", () => {
+      const addr = proxy.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      modelRewriteProxyServer = proxy;
+      modelRewriteProxyPort = port;
+      resolve(port);
+    });
+    proxy.on("error", reject);
+  });
+}
+
 function main(): void {
   const configuredPort =
     typeof bridgeConfig.port === "number" && Number.isFinite(bridgeConfig.port)
@@ -1648,6 +1745,18 @@ function main(): void {
   const port = Number(process.env.ACP_BRIDGE_PORT || String(configuredPort));
   const host =
     process.env.ACP_BRIDGE_HOST || (typeof bridgeConfig.host === "string" ? bridgeConfig.host : "127.0.0.1");
+
+  // Pre-start model-rewrite proxy if OPENAI_BASE_URL is set
+  const realBaseUrl = process.env.OPENAI_BASE_URL;
+  const proxyReady = realBaseUrl
+    ? startModelRewriteProxy(realBaseUrl).then((p) => {
+        console.error(`[model-rewrite-proxy] started on port ${p}, forwarding to ${realBaseUrl}`);
+      }).catch((err) => {
+        console.error(`[model-rewrite-proxy] failed to start: ${err?.message || err}`);
+      })
+    : Promise.resolve();
+
+  proxyReady.then(() => {
   const server = createServer((req, res) => {
     void handler(req, res);
   });
@@ -1695,6 +1804,7 @@ function main(): void {
   process.on("SIGTERM", () => {
     void shutdown();
   });
+  }); // end proxyReady.then
 }
 
 main();
