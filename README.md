@@ -315,6 +315,35 @@ Use ACP's top-level `data` and `mimeType` fields for images. An Anthropic-style 
 
 Responses keep the existing shape: JSON returns `name`, `state`, `stopReason`, and text `response`; SSE sends text `chunk` events followed by `done`, or an `error` event for an upstream failure. Image/audio interpretation, embedded binary file support, and resource-link resolution depend on the agent's advertised prompt capabilities and adapter. The bridge forwards supplied resources; media decoding and fetching referenced files remain agent responsibilities.
 
+#### Migrating the issue #2 example and sending local attachments
+
+The image example in issue #2 uses an Anthropic-style `source` object. The HTTP API follows the native ACP SDK 0.14.1 schema: move `source.data` to the image block's `data`, and `source.media_type` to `mimeType`, then remove `source`. Send raw base64 bytes, without a `data:image/png;base64,` prefix. The original example receives HTTP 400 with this migration guidance in both JSON and streaming mode. A valid native ACP image is forwarded unchanged. The bridge does not introduce a second media schema or silently convert vendor-specific payloads.
+
+The following Python 3 command creates a request from real local attachments. Place `screenshot.png` and `report.pdf` in the current directory, then run it and use the curl commands above:
+
+```bash
+python3 - <<'PYTHON'
+import base64
+import json
+from pathlib import Path
+
+def encoded(path):
+    return base64.b64encode(Path(path).read_bytes()).decode("ascii")
+
+request = {"content": [
+    {"type": "text", "text": "Analyze this screenshot and PDF"},
+    {"type": "image", "mimeType": "image/png", "data": encoded("screenshot.png")},
+    {"type": "resource", "resource": {
+        "uri": Path("report.pdf").resolve().as_uri(),
+        "mimeType": "application/pdf", "blob": encoded("report.pdf")
+    }}
+]}
+Path("request.json").write_text(json.dumps(request), encoding="utf-8")
+PYTHON
+```
+
+An embedded resource carries its bytes in the request; its URI identifies the attachment. A `resource_link` carries a reference and requires the agent to resolve it; a client-local `file://` path may be inaccessible to a remote agent. Schema validation checks structure and field types, not base64 decoding, MIME accuracy, media integrity, or model comprehension. Confirm the selected adapter advertises `image` and `embeddedContext` prompt capabilities and supports the chosen media types. Test recognizable image details and PDF text against known expected answers in both response modes before deploying an attachment workflow.
+
 Run `npm test` to build and exercise both request formats over HTTP and ACP stdio using a local test agent. The test agent captures protocol requests and emits deterministic text chunks, upstream errors, and timeouts. Actual model interpretation of images, PDFs, audio, and resource references requires integration testing with your selected ACP agent.
 
 ## Task System
