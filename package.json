@@ -10,6 +10,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/ask.test.cjs",
     "daemon": "node dist/daemon.js"
   },
   "keywords": [

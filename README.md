@@ -212,7 +212,7 @@ The daemon exposes a REST API:
 | `POST` | `/agents` | Start a new agent |
 | `GET` | `/agents` | List all agents |
 | `GET` | `/agents/:name` | Get agent status |
-| `POST` | `/agents/:name/ask` | Send prompt, wait for response |
+| `POST` | `/agents/:name/ask` | Send text or ACP content, wait for response |
 | `POST` | `/agents/:name/ask?stream=true` | SSE stream chunks and final result |
 | `POST` | `/agents/:name/approve` | Approve next pending permission request |
 | `POST` | `/agents/:name/deny` | Deny next pending permission request |
@@ -224,6 +224,127 @@ The daemon exposes a REST API:
 | `GET` | `/tasks/:id` | Get task status and aggregate output |
 | `GET` | `/tasks/:id/subtasks/:subtaskId` | Get one subtask status and output |
 | `DELETE` | `/tasks/:id` | Cancel a running task |
+
+### Ask: text and multimodal content
+
+Existing text requests and CLI commands retain their behavior. A non-empty `prompt` string is sent to ACP as a single text block, preserving its text:
+
+```bash
+curl http://127.0.0.1:7800/agents/my-agent/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"refactor the auth module"}'
+```
+
+For multimodal requests, send a non-empty `content` array of native ACP content blocks. When `content` is present, it supplies the entire ACP prompt, in array order. The optional `prompt` field must be a string and is ignored in this case; include the instruction as a text block inside `content`.
+
+| Request field | Behavior |
+|---------------|----------|
+| `prompt` | Non-empty text string for legacy requests; optional string when `content` is present |
+| `content` | Non-empty ACP content array; takes precedence over `prompt` |
+
+For example, save this JSON as `request.json`, replacing the image data with the raw base64-encoded bytes of your image:
+
+```json
+{
+  "content": [
+    { "type": "text", "text": "Please analyze this image" },
+    {
+      "type": "image",
+      "mimeType": "image/png",
+      "data": "BASE64_IMAGE_BYTES"
+    }
+  ]
+}
+```
+
+```bash
+# Wait for the complete response
+curl http://127.0.0.1:7800/agents/my-agent/ask \
+  -H 'Content-Type: application/json' \
+  --data-binary @request.json
+
+# Stream the same request as SSE
+curl -N 'http://127.0.0.1:7800/agents/my-agent/ask?stream=true' \
+  -H 'Content-Type: application/json' \
+  --data-binary @request.json
+```
+
+The bridge accepts the content types defined by the installed ACP SDK:
+
+| ACP type | Required fields | Purpose |
+|----------|-----------------|---------|
+| `text` | `text` | Instructions or plain text |
+| `image` | `data`, `mimeType` | Base64 image bytes, with optional `uri` |
+| `audio` | `data`, `mimeType` | Base64 audio bytes |
+| `resource` | `resource.uri` and `resource.text` or `resource.blob` | Embedded text or base64 binary file contents; optional `resource.mimeType` |
+| `resource_link` | `uri`, `name` | A resource reference, with optional `mimeType`, `title`, `description`, `size` |
+
+Files use ACP resources. This request combines a text file, an embedded PDF, and a file reference; replace `BASE64_PDF_BYTES` with the PDF's raw base64 bytes and use URIs appropriate for your agent:
+
+```json
+{
+  "content": [
+    { "type": "text", "text": "Compare these attachments" },
+    {
+      "type": "resource",
+      "resource": {
+        "uri": "file:///attachments/notes.txt",
+        "mimeType": "text/plain",
+        "text": "Measurements from the latest run"
+      }
+    },
+    {
+      "type": "resource",
+      "resource": {
+        "uri": "file:///attachments/report.pdf",
+        "mimeType": "application/pdf",
+        "blob": "BASE64_PDF_BYTES"
+      }
+    },
+    {
+      "type": "resource_link",
+      "uri": "file:///attachments/reference.txt",
+      "name": "reference.txt",
+      "mimeType": "text/plain"
+    }
+  ]
+}
+```
+
+Use ACP's top-level `data` and `mimeType` fields for images. An Anthropic-style `source` object or a `type: "file"` block fails ACP validation. Content order, `annotations`, `_meta`, and extension fields are passed through. Body shape, array length, block types, required fields, and optional field types are checked against the installed SDK schema. Invalid requests receive HTTP 400 JSON before starting an ACP prompt or sending SSE headers, including when `stream=true` is requested.
+
+Responses keep the existing shape: JSON returns `name`, `state`, `stopReason`, and text `response`; SSE sends text `chunk` events followed by `done`, or an `error` event for an upstream failure. Image/audio interpretation, embedded binary file support, and resource-link resolution depend on the agent's advertised prompt capabilities and adapter. The bridge forwards supplied resources; media decoding and fetching referenced files remain agent responsibilities.
+
+#### Migrating the issue #2 example and sending local attachments
+
+The image example in issue #2 uses an Anthropic-style `source` object. The HTTP API follows the native ACP SDK 0.14.1 schema: move `source.data` to the image block's `data`, and `source.media_type` to `mimeType`, then remove `source`. Send raw base64 bytes, without a `data:image/png;base64,` prefix. The original example receives HTTP 400 with this migration guidance in both JSON and streaming mode. A valid native ACP image is forwarded unchanged. The bridge does not introduce a second media schema or silently convert vendor-specific payloads.
+
+The following Python 3 command creates a request from real local attachments. Place `screenshot.png` and `report.pdf` in the current directory, then run it and use the curl commands above:
+
+```bash
+python3 - <<'PYTHON'
+import base64
+import json
+from pathlib import Path
+
+def encoded(path):
+    return base64.b64encode(Path(path).read_bytes()).decode("ascii")
+
+request = {"content": [
+    {"type": "text", "text": "Analyze this screenshot and PDF"},
+    {"type": "image", "mimeType": "image/png", "data": encoded("screenshot.png")},
+    {"type": "resource", "resource": {
+        "uri": Path("report.pdf").resolve().as_uri(),
+        "mimeType": "application/pdf", "blob": encoded("report.pdf")
+    }}
+]}
+Path("request.json").write_text(json.dumps(request), encoding="utf-8")
+PYTHON
+```
+
+An embedded resource carries its bytes in the request; its URI identifies the attachment. A `resource_link` carries a reference and requires the agent to resolve it; a client-local `file://` path may be inaccessible to a remote agent. Schema validation checks structure and field types, not base64 decoding, MIME accuracy, media integrity, or model comprehension. Confirm the selected adapter advertises `image` and `embeddedContext` prompt capabilities and supports the chosen media types. Test recognizable image details and PDF text against known expected answers in both response modes before deploying an attachment workflow.
+
+Run `npm test` to build and exercise both request formats over HTTP and ACP stdio using a local test agent. The test agent captures protocol requests and emits deterministic text chunks, upstream errors, and timeouts. Actual model interpretation of images, PDFs, audio, and resource references requires integration testing with your selected ACP agent.
 
 ## Task System
 

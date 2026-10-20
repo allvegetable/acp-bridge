@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import { zContentBlock } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
 
 type AgentState = "starting" | "idle" | "working" | "stopped" | "error";
 
@@ -1203,6 +1204,35 @@ function parseAskTimeoutMs(): number {
   return raw;
 }
 
+function parseAskInput(body: unknown): { prompt: acp.ContentBlock[] } | { error: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "request body must be a JSON object" };
+  }
+  const input = body as Record<string, unknown>;
+  if ("content" in input) {
+    if ("prompt" in input && typeof input.prompt !== "string") {
+      return { error: "prompt must be a string when provided" };
+    }
+    if (!Array.isArray(input.content) || input.content.length === 0) {
+      return { error: "content must be a non-empty array of ACP content blocks" };
+    }
+    for (const [index, block] of input.content.entries()) {
+      if (!zContentBlock.safeParse(block).success) {
+        if (block && typeof block === "object" && block.type === "image" && "source" in block) {
+          return { error: `content[${index}]: ACP images require top-level data (raw base64) and mimeType; move source.data to data and source.media_type to mimeType` };
+        }
+        return { error: `content[${index}] must be a valid ACP content block (text, image, audio, resource, or resource_link)` };
+      }
+    }
+    // Validate with ACP's schema but preserve the original blocks and extension fields.
+    return { prompt: input.content as acp.ContentBlock[] };
+  }
+  if (!input.prompt || typeof input.prompt !== "string") {
+    return { error: "prompt is required" };
+  }
+  return { prompt: [{ type: "text", text: input.prompt }] };
+}
+
 type AskResult = {
   name: string;
   state: AgentState;
@@ -1221,7 +1251,7 @@ type DoctorResult = {
 
 async function askAgent(
   name: string,
-  prompt: string,
+  prompt: string | acp.ContentBlock[],
   onChunk?: (chunk: string) => void,
   activeTask?: { taskId: string; subtaskId: string },
 ): Promise<AskResult> {
@@ -1244,8 +1274,8 @@ async function askAgent(
     const response = await Promise.race([
       record.connection.prompt({
         sessionId: record.sessionId,
-        prompt: [{ type: "text", text: prompt }],
-      } as any),
+        prompt: typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt,
+      }),
       new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
           reject(new HttpError(408, `ask timeout after ${timeoutMs}ms`));
@@ -1520,14 +1550,24 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
 
     if (parts.length === 3 && parts[0] === "agents" && method === "POST" && parts[2] === "ask") {
       const name = parts[1];
-      const body = await readJson(req);
-      if (!body.prompt || typeof body.prompt !== "string") {
-        writeJson(res, 400, { error: "prompt is required" });
+      let body: unknown;
+      try {
+        body = await readJson(req);
+      } catch (error) {
+        if (error instanceof SyntaxError) {
+          writeJson(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        throw error;
+      }
+      const input = parseAskInput(body);
+      if ("error" in input) {
+        writeJson(res, 400, { error: input.error });
         return;
       }
       const stream = requestUrl(req).searchParams.get("stream") === "true";
       if (!stream) {
-        const result = await askAgent(name, body.prompt);
+        const result = await askAgent(name, input.prompt);
         writeJson(res, 200, result);
         return;
       }
@@ -1539,7 +1579,7 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
       res.flushHeaders();
 
       try {
-        const result = await askAgent(name, body.prompt, (chunk) => {
+        const result = await askAgent(name, input.prompt, (chunk) => {
           writeSse(res, "chunk", { chunk });
         });
         writeSse(res, "done", result);
