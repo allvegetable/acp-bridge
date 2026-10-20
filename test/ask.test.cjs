@@ -157,6 +157,13 @@ const successes = [
 ];
 
 const invalidInputs = [
+  ["issue #2 original image example", {
+    prompt: "Please analyze this image",
+    content: [
+      { type: "text", text: "Please analyze this image" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "..." } },
+    ],
+  }, /content\[1\].*top-level data.*mimeType.*source\.data.*source\.media_type/],
   ["missing input", {}, /prompt is required/],
   ["empty prompt", { prompt: "" }, /prompt is required/],
   ...[null, 42, false, {}, []].map((prompt) => [`legacy prompt ${JSON.stringify(prompt)}`, { prompt }, /prompt is required/]),
