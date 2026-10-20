@@ -1218,6 +1218,9 @@ function parseAskInput(body: unknown): { prompt: acp.ContentBlock[] } | { error:
     }
     for (const [index, block] of input.content.entries()) {
       if (!zContentBlock.safeParse(block).success) {
+        if (block && typeof block === "object" && block.type === "image" && "source" in block) {
+          return { error: `content[${index}]: ACP images require top-level data (raw base64) and mimeType; move source.data to data and source.media_type to mimeType` };
+        }
         return { error: `content[${index}] must be a valid ACP content block (text, image, audio, resource, or resource_link)` };
       }
     }
